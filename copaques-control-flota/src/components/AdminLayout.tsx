@@ -742,6 +742,8 @@ export function AdminLayout({ user, onLogout }: AdminLayoutProps) {
                     <option value="INICIO_JORNADA">Inicio de Jornada</option>
                     <option value="ENTRADA">Entrada</option>
                     <option value="SALIDA">Salida</option>
+                    <option value="INICIO_ALMUERZO">Inicio de Almuerzo</option>
+                    <option value="FIN_ALMUERZO">Fin de Almuerzo</option>
                     <option value="FIN_JORNADA">Fin de Jornada</option>
                   </select>
                 </div>
@@ -818,9 +820,12 @@ export function AdminLayout({ user, onLogout }: AdminLayoutProps) {
                                     ? 'text-emerald-700'
                                     : ev.event_type === 'SALIDA'
                                       ? 'text-amber-700'
-                                      : ev.event_type === 'FIN_JORNADA'
-                                        ? 'text-red-700'
-                                        : 'text-slate-900'
+                                      : ev.event_type === 'INICIO_ALMUERZO' ||
+                                          ev.event_type === 'FIN_ALMUERZO'
+                                        ? 'text-orange-700'
+                                        : ev.event_type === 'FIN_JORNADA'
+                                          ? 'text-red-700'
+                                          : 'text-slate-900'
                                 }`}
                               >
                                 {formatEventLabel(ev.event_type)}
@@ -883,6 +888,7 @@ export function AdminLayout({ user, onLogout }: AdminLayoutProps) {
               vehicles={vehicles}
               users={users}
               selectedSedeId={selectedSedeId}
+              userRole={user.role}
             />
           )}
 

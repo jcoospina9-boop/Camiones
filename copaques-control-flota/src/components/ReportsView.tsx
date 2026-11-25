@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Download, FileSpreadsheet, FileText } from 'lucide-react';
+import { Clock, Download, FileSpreadsheet, FileText, Save } from 'lucide-react';
 import { apiFetch } from '../lib/api.ts';
 import { exportReportToExcel, exportReportToPDF } from '../lib/exportReports.ts';
 import {
@@ -8,6 +8,7 @@ import {
   getColombiaToday,
   type ReportResponse,
   type User,
+  type UserRole,
   type Vehicle,
 } from '../types.ts';
 
@@ -15,6 +16,7 @@ interface ReportsViewProps {
   vehicles: Vehicle[];
   users: User[];
   selectedSedeId: number | null;
+  userRole: UserRole;
 }
 
 function toYmd(d: Date): string {
@@ -24,19 +26,24 @@ function toYmd(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
-export function ReportsView({ vehicles, users, selectedSedeId }: ReportsViewProps) {
+export function ReportsView({ vehicles, users, selectedSedeId, userRole }: ReportsViewProps) {
   const today = getColombiaToday();
   const [period, setPeriod] = useState<'daily' | 'weekly' | 'monthly' | 'custom'>('daily');
   const [startDate, setStartDate] = useState(today);
   const [endDate, setEndDate] = useState(today);
   const [vehicleId, setVehicleId] = useState('');
   const [userId, setUserId] = useState('');
-  const [activeTab, setActiveTab] = useState<'vehicles' | 'drivers' | 'stays' | 'events'>('vehicles');
+  const [activeTab, setActiveTab] = useState<'vehicles' | 'drivers' | 'shifts' | 'stays' | 'events'>('vehicles');
 
   const [report, setReport] = useState<ReportResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const [dailyHoursInput, setDailyHoursInput] = useState('8');
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [settingsMsg, setSettingsMsg] = useState<string | null>(null);
+
+  const isGerencia = userRole === 'GERENCIA';
   const drivers = users.filter((u) => u.role === 'CONDUCTOR');
 
   function applyPreset(preset: 'daily' | 'weekly' | 'monthly') {
@@ -65,6 +72,7 @@ export function ReportsView({ vehicles, users, selectedSedeId }: ReportsViewProp
       if (userId) params.set('userId', userId);
       const data = await apiFetch<ReportResponse>(`/api/admin/reports?${params.toString()}`);
       setReport(data);
+      setDailyHoursInput(String(data.summary.dailyWorkHours ?? 8));
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error al generar reporte.');
     } finally {
@@ -76,8 +84,78 @@ export function ReportsView({ vehicles, users, selectedSedeId }: ReportsViewProp
     loadReport();
   }, [loadReport]);
 
+  async function handleSaveDailyHours(e: React.FormEvent) {
+    e.preventDefault();
+    const parsed = Number(dailyHoursInput);
+    if (!Number.isFinite(parsed) || parsed < 1 || parsed > 24) {
+      setError('Ingresa una jornada diaria válida entre 1 y 24 horas.');
+      return;
+    }
+    setSavingSettings(true);
+    setError(null);
+    setSettingsMsg(null);
+    try {
+      const res = await apiFetch<{ dailyWorkHours: number }>('/api/admin/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ dailyWorkHours: parsed }),
+      });
+      setDailyHoursInput(String(res.dailyWorkHours));
+      setSettingsMsg(`Jornada laboral actualizada a ${res.dailyWorkHours}h/día.`);
+      await loadReport();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Error al actualizar jornada laboral.');
+    } finally {
+      setSavingSettings(false);
+    }
+  }
+
   return (
     <div className="space-y-5">
+      {/* Daily Work Hours & Overtime Rule Bar */}
+      <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-wrap items-center justify-between gap-4">
+        <div className="flex items-start gap-3">
+          <div className="w-9 h-9 rounded-lg bg-emerald-50 border border-emerald-200 flex items-center justify-center shrink-0">
+            <Clock className="w-4 h-4 text-emerald-800" />
+          </div>
+          <div>
+            <p className="text-sm font-bold text-slate-900">
+              Jornada Diaria Laboral: {report?.summary.dailyWorkHours ?? Number(dailyHoursInput || 8)} horas / día
+            </p>
+            <p className="text-xs text-slate-600">
+              El tiempo de almuerzo se descuenta de la jornada. Todo tiempo trabajado neto que supere este límite cuenta automáticamente como horas extras.
+            </p>
+            {settingsMsg && (
+              <p className="mt-1 text-xs font-semibold text-emerald-700">{settingsMsg}</p>
+            )}
+          </div>
+        </div>
+
+        {isGerencia && (
+          <form onSubmit={handleSaveDailyHours} className="flex items-center gap-2">
+            <label className="text-xs font-medium text-slate-600 whitespace-nowrap">
+              Horas/día:
+            </label>
+            <input
+              type="number"
+              min={1}
+              max={24}
+              step={0.5}
+              value={dailyHoursInput}
+              onChange={(e) => setDailyHoursInput(e.target.value)}
+              className="w-20 h-9 px-2.5 rounded-lg border border-slate-300 text-sm font-mono tabular-nums text-center"
+            />
+            <button
+              type="submit"
+              disabled={savingSettings}
+              className="h-9 px-3.5 rounded-lg bg-emerald-800 hover:bg-emerald-900 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-60 whitespace-nowrap"
+            >
+              <Save className="w-3.5 h-3.5" />
+              <span>{savingSettings ? 'Guardando...' : 'Guardar Jornada'}</span>
+            </button>
+          </form>
+        )}
+      </div>
+
       {/* Controls & Presets */}
       <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -206,7 +284,7 @@ export function ReportsView({ vehicles, users, selectedSedeId }: ReportsViewProp
       {/* Summary KPIs */}
       {report && (
         <>
-          <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
             <div className="bg-white border border-slate-200 rounded-xl p-4">
               <p className="text-xs text-slate-500">Eventos Totales</p>
               <p className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-900">
@@ -226,15 +304,31 @@ export function ReportsView({ vehicles, users, selectedSedeId }: ReportsViewProp
               </p>
             </div>
             <div className="bg-white border border-slate-200 rounded-xl p-4">
-              <p className="text-xs text-slate-500">Horas Trabajadas</p>
+              <p className="text-xs text-slate-500">Horas Trabajadas (Netas)</p>
               <p className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-900">
                 {report.summary.totalWorkedHours} h
               </p>
             </div>
             <div className="bg-white border border-slate-200 rounded-xl p-4">
-              <p className="text-xs text-slate-500">Horas en Puntos</p>
+              <p className="text-xs text-slate-500">Horas Almuerzo</p>
               <p className="mt-1 text-2xl font-bold font-mono tabular-nums text-amber-700">
-                {report.summary.totalStayHours} h
+                {report.summary.totalLunchHours} h
+              </p>
+            </div>
+            <div
+              className={`border rounded-xl p-4 ${
+                report.summary.totalOvertimeHours > 0
+                  ? 'bg-orange-50 border-orange-200'
+                  : 'bg-white border-slate-200'
+              }`}
+            >
+              <p className="text-xs text-slate-600 font-medium">Horas Extras</p>
+              <p
+                className={`mt-1 text-2xl font-bold font-mono tabular-nums ${
+                  report.summary.totalOvertimeHours > 0 ? 'text-orange-700' : 'text-slate-900'
+                }`}
+              >
+                {report.summary.totalOvertimeHours} h
               </p>
             </div>
           </div>
@@ -246,6 +340,7 @@ export function ReportsView({ vehicles, users, selectedSedeId }: ReportsViewProp
                 [
                   ['vehicles', 'Por Vehículo'],
                   ['drivers', 'Por Conductor'],
+                  ['shifts', 'Jornadas y Horas Extras'],
                   ['stays', 'Tiempo por Ubicación'],
                   ['events', 'Detalle de Eventos'],
                 ] as const
@@ -275,15 +370,16 @@ export function ReportsView({ vehicles, users, selectedSedeId }: ReportsViewProp
                       <th className="py-2.5 px-4 text-right">Jornadas</th>
                       <th className="py-2.5 px-4 text-right">Visitas</th>
                       <th className="py-2.5 px-4 text-right">Salidas</th>
-                      <th className="py-2.5 px-4 text-right">Eventos</th>
-                      <th className="py-2.5 px-4 text-right">Horas Trabajadas</th>
+                      <th className="py-2.5 px-4 text-right">Horas Netas</th>
+                      <th className="py-2.5 px-4 text-right">Almuerzo</th>
+                      <th className="py-2.5 px-4 text-right">Horas Extras</th>
                       <th className="py-2.5 px-4 text-right">Tiempo en Puntos</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {report.byVehicle.length === 0 ? (
                       <tr>
-                        <td colSpan={8} className="py-8 text-center text-slate-500">
+                        <td colSpan={9} className="py-8 text-center text-slate-500">
                           No hay actividad en el período seleccionado.
                         </td>
                       </tr>
@@ -297,9 +393,18 @@ export function ReportsView({ vehicles, users, selectedSedeId }: ReportsViewProp
                             {row.visitsCount}
                           </td>
                           <td className="py-2.5 px-4 text-right font-mono tabular-nums">{row.exitsCount}</td>
-                          <td className="py-2.5 px-4 text-right font-mono tabular-nums">{row.totalEvents}</td>
                           <td className="py-2.5 px-4 text-right font-mono tabular-nums font-semibold">
                             {formatMinutesAsHours(row.workedMinutes)}
+                          </td>
+                          <td className="py-2.5 px-4 text-right font-mono tabular-nums text-amber-700">
+                            {formatMinutesAsHours(row.lunchMinutes)}
+                          </td>
+                          <td
+                            className={`py-2.5 px-4 text-right font-mono tabular-nums font-semibold ${
+                              row.overtimeMinutes > 0 ? 'text-orange-700' : 'text-slate-400'
+                            }`}
+                          >
+                            {formatMinutesAsHours(row.overtimeMinutes)}
                           </td>
                           <td className="py-2.5 px-4 text-right font-mono tabular-nums">
                             {formatMinutesAsHours(row.stayMinutes)}
@@ -321,15 +426,16 @@ export function ReportsView({ vehicles, users, selectedSedeId }: ReportsViewProp
                       <th className="py-2.5 px-4">Usuario</th>
                       <th className="py-2.5 px-4 text-right">Jornadas</th>
                       <th className="py-2.5 px-4 text-right">Visitas</th>
-                      <th className="py-2.5 px-4 text-right">Eventos</th>
-                      <th className="py-2.5 px-4 text-right">Horas Trabajadas</th>
+                      <th className="py-2.5 px-4 text-right">Horas Netas</th>
+                      <th className="py-2.5 px-4 text-right">Almuerzo</th>
+                      <th className="py-2.5 px-4 text-right">Horas Extras</th>
                       <th className="py-2.5 px-4 text-right">Tiempo en Puntos</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {report.byDriver.length === 0 ? (
                       <tr>
-                        <td colSpan={7} className="py-8 text-center text-slate-500">
+                        <td colSpan={8} className="py-8 text-center text-slate-500">
                           No hay datos de conductores para el período.
                         </td>
                       </tr>
@@ -342,12 +448,83 @@ export function ReportsView({ vehicles, users, selectedSedeId }: ReportsViewProp
                           <td className="py-2.5 px-4 text-right font-mono tabular-nums text-emerald-700 font-semibold">
                             {row.visitsCount}
                           </td>
-                          <td className="py-2.5 px-4 text-right font-mono tabular-nums">{row.totalEvents}</td>
                           <td className="py-2.5 px-4 text-right font-mono tabular-nums font-semibold">
                             {formatMinutesAsHours(row.workedMinutes)}
                           </td>
+                          <td className="py-2.5 px-4 text-right font-mono tabular-nums text-amber-700">
+                            {formatMinutesAsHours(row.lunchMinutes)}
+                          </td>
+                          <td
+                            className={`py-2.5 px-4 text-right font-mono tabular-nums font-semibold ${
+                              row.overtimeMinutes > 0 ? 'text-orange-700' : 'text-slate-400'
+                            }`}
+                          >
+                            {formatMinutesAsHours(row.overtimeMinutes)}
+                          </td>
                           <td className="py-2.5 px-4 text-right font-mono tabular-nums">
                             {formatMinutesAsHours(row.stayMinutes)}
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {activeTab === 'shifts' && (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse text-sm">
+                  <thead>
+                    <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600">
+                      <th className="py-2.5 px-4">Conductor</th>
+                      <th className="py-2.5 px-4">Vehículo</th>
+                      <th className="py-2.5 px-4">Inicio</th>
+                      <th className="py-2.5 px-4">Fin</th>
+                      <th className="py-2.5 px-4 text-right">Almuerzo</th>
+                      <th className="py-2.5 px-4 text-right">Trabajado Neto</th>
+                      <th className="py-2.5 px-4 text-right">Horas Extras</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {report.shifts.length === 0 ? (
+                      <tr>
+                        <td colSpan={7} className="py-8 text-center text-slate-500">
+                          No hay jornadas registradas en este período.
+                        </td>
+                      </tr>
+                    ) : (
+                      report.shifts.map((sh, idx) => (
+                        <tr key={idx} className="hover:bg-slate-50">
+                          <td className="py-2.5 px-4 font-semibold text-slate-900">
+                            {sh.driverName}
+                            {sh.driverCode ? (
+                              <span className="ml-1.5 text-xs font-mono text-slate-400">
+                                ({sh.driverCode})
+                              </span>
+                            ) : null}
+                          </td>
+                          <td className="py-2.5 px-4 font-mono text-slate-700 whitespace-nowrap">
+                            {sh.vehicleCode} · {sh.vehiclePlate}
+                          </td>
+                          <td className="py-2.5 px-4 font-mono tabular-nums text-xs text-slate-600 whitespace-nowrap">
+                            {sh.startTime}
+                          </td>
+                          <td className="py-2.5 px-4 font-mono tabular-nums text-xs text-slate-600 whitespace-nowrap">
+                            {sh.endTime ?? 'En curso'}
+                          </td>
+                          <td className="py-2.5 px-4 text-right font-mono tabular-nums text-amber-700">
+                            {formatMinutesAsHours(sh.lunchMinutes)}
+                          </td>
+                          <td className="py-2.5 px-4 text-right font-mono tabular-nums font-semibold text-slate-900">
+                            {formatMinutesAsHours(sh.workedMinutes)}
+                          </td>
+                          <td
+                            className={`py-2.5 px-4 text-right font-mono tabular-nums font-bold ${
+                              (sh.overtimeMinutes ?? 0) > 0 ? 'text-orange-700' : 'text-slate-400'
+                            }`}
+                          >
+                            {formatMinutesAsHours(sh.overtimeMinutes)}
                           </td>
                         </tr>
                       ))

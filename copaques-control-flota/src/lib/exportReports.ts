@@ -17,7 +17,7 @@ export function exportReportToPDF(report: ReportResponse): void {
   doc.setFontSize(10);
   doc.setTextColor(71, 85, 105);
   doc.text(
-    `Período: ${report.summary.startDate} al ${report.summary.endDate}  |  Eventos: ${report.summary.totalEvents}  |  Visitas (Entradas): ${report.summary.totalVisits}  |  Horas Trabajadas: ${report.summary.totalWorkedHours}h`,
+    `Período: ${report.summary.startDate} al ${report.summary.endDate}  |  Jornada diaria: ${report.summary.dailyWorkHours}h  |  Trabajado Neto: ${report.summary.totalWorkedHours}h  |  Almuerzo: ${report.summary.totalLunchHours}h  |  Horas Extras: ${report.summary.totalOvertimeHours}h`,
     40,
     60
   );
@@ -31,18 +31,19 @@ export function exportReportToPDF(report: ReportResponse): void {
 
     autoTable(doc, {
       startY: nextY + 8,
-      head: [['Vehículo', 'Placa', 'Jornadas', 'Visitas', 'Salidas', 'Eventos', 'Horas Trabajadas', 'Tiempo en Puntos']],
+      head: [['Vehículo', 'Placa', 'Jornadas', 'Visitas', 'Salidas', 'Horas Netas', 'Almuerzo', 'Horas Extras', 'Tiempo en Puntos']],
       body: report.byVehicle.map((v) => [
         v.label,
         v.sublabel,
         String(v.shiftsCount),
         String(v.visitsCount),
         String(v.exitsCount),
-        String(v.totalEvents),
         formatMinutesAsHours(v.workedMinutes),
+        formatMinutesAsHours(v.lunchMinutes),
+        formatMinutesAsHours(v.overtimeMinutes),
         formatMinutesAsHours(v.stayMinutes),
       ]),
-      styles: { fontSize: 8.5, cellPadding: 5 },
+      styles: { fontSize: 8, cellPadding: 4.5 },
       headStyles: { fillColor: [6, 78, 59] },
     });
 
@@ -56,21 +57,45 @@ export function exportReportToPDF(report: ReportResponse): void {
 
     autoTable(doc, {
       startY: nextY + 8,
-      head: [['Conductor', 'Usuario', 'Jornadas', 'Visitas', 'Eventos', 'Horas Trabajadas', 'Tiempo en Puntos']],
+      head: [['Conductor', 'Usuario', 'Jornadas', 'Visitas', 'Horas Netas', 'Almuerzo', 'Horas Extras', 'Tiempo en Puntos']],
       body: report.byDriver.map((d) => [
         d.label,
         d.sublabel,
         String(d.shiftsCount),
         String(d.visitsCount),
-        String(d.totalEvents),
         formatMinutesAsHours(d.workedMinutes),
+        formatMinutesAsHours(d.lunchMinutes),
+        formatMinutesAsHours(d.overtimeMinutes),
         formatMinutesAsHours(d.stayMinutes),
       ]),
-      styles: { fontSize: 8.5, cellPadding: 5 },
+      styles: { fontSize: 8, cellPadding: 4.5 },
       headStyles: { fillColor: [6, 95, 70] },
     });
 
     nextY = (doc as unknown as { lastAutoTable: { finalY: number } }).lastAutoTable.finalY + 24;
+  }
+
+  if (report.shifts.length > 0) {
+    doc.addPage();
+    doc.setFontSize(12);
+    doc.setTextColor(15, 23, 42);
+    doc.text(`Jornadas y Horas Extras (Meta diaria: ${report.summary.dailyWorkHours}h)`, 40, 42);
+
+    autoTable(doc, {
+      startY: 52,
+      head: [['Conductor', 'Vehículo', 'Inicio', 'Fin', 'Almuerzo', 'Trabajado Neto', 'Horas Extras']],
+      body: report.shifts.map((sh) => [
+        sh.driverCode ? `${sh.driverName} (${sh.driverCode})` : sh.driverName,
+        `${sh.vehicleCode} (${sh.vehiclePlate})`,
+        sh.startTime,
+        sh.endTime ?? 'En curso',
+        formatMinutesAsHours(sh.lunchMinutes),
+        formatMinutesAsHours(sh.workedMinutes),
+        formatMinutesAsHours(sh.overtimeMinutes),
+      ]),
+      styles: { fontSize: 8, cellPadding: 4 },
+      headStyles: { fillColor: [6, 78, 59] },
+    });
   }
 
   if (report.locationStays.length > 0) {
@@ -128,10 +153,13 @@ export function exportReportToExcel(report: ReportResponse): void {
   const summaryRows = [
     { Indicador: 'Fecha Inicio', Valor: report.summary.startDate },
     { Indicador: 'Fecha Fin', Valor: report.summary.endDate },
+    { Indicador: 'Jornada Diaria Configurada (h)', Valor: report.summary.dailyWorkHours },
     { Indicador: 'Total Eventos', Valor: report.summary.totalEvents },
     { Indicador: 'Total Visitas (Entradas)', Valor: report.summary.totalVisits },
     { Indicador: 'Total Jornadas Iniciadas', Valor: report.summary.totalShifts },
-    { Indicador: 'Total Horas Trabajadas', Valor: report.summary.totalWorkedHours },
+    { Indicador: 'Total Horas Trabajadas (Netas)', Valor: report.summary.totalWorkedHours },
+    { Indicador: 'Total Horas de Almuerzo', Valor: report.summary.totalLunchHours },
+    { Indicador: 'Total Horas Extras', Valor: report.summary.totalOvertimeHours },
     { Indicador: 'Total Horas en Ubicaciones', Valor: report.summary.totalStayHours },
   ];
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), 'Resumen');
@@ -143,8 +171,12 @@ export function exportReportToExcel(report: ReportResponse): void {
     Visitas: v.visitsCount,
     Salidas: v.exitsCount,
     Eventos: v.totalEvents,
-    'Minutos Trabajados': v.workedMinutes,
-    'Horas Trabajadas': formatMinutesAsHours(v.workedMinutes),
+    'Minutos Trabajados (Netos)': v.workedMinutes,
+    'Horas Netas': formatMinutesAsHours(v.workedMinutes),
+    'Almuerzo (min)': v.lunchMinutes,
+    'Horas Almuerzo': formatMinutesAsHours(v.lunchMinutes),
+    'Horas Extras (min)': v.overtimeMinutes,
+    'Horas Extras': formatMinutesAsHours(v.overtimeMinutes),
     'Tiempo en Ubicaciones': formatMinutesAsHours(v.stayMinutes),
   }));
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(vehicleRows), 'Por Vehiculo');
@@ -156,10 +188,31 @@ export function exportReportToExcel(report: ReportResponse): void {
     Visitas: d.visitsCount,
     Salidas: d.exitsCount,
     Eventos: d.totalEvents,
-    'Horas Trabajadas': formatMinutesAsHours(d.workedMinutes),
+    'Horas Netas': formatMinutesAsHours(d.workedMinutes),
+    'Almuerzo (min)': d.lunchMinutes,
+    'Horas Almuerzo': formatMinutesAsHours(d.lunchMinutes),
+    'Horas Extras (min)': d.overtimeMinutes,
+    'Horas Extras': formatMinutesAsHours(d.overtimeMinutes),
     'Tiempo en Ubicaciones': formatMinutesAsHours(d.stayMinutes),
   }));
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(driverRows), 'Por Conductor');
+
+  const shiftRows = report.shifts.map((sh) => ({
+    Fecha: sh.date,
+    Conductor: sh.driverName,
+    Código: sh.driverCode,
+    Vehículo: sh.vehicleCode,
+    Placa: sh.vehiclePlate,
+    Inicio: sh.startTime,
+    Fin: sh.endTime ?? 'En curso',
+    'Almuerzo (min)': sh.lunchMinutes,
+    Almuerzo: formatMinutesAsHours(sh.lunchMinutes),
+    'Trabajado Neto (min)': sh.workedMinutes ?? '',
+    'Trabajado Neto': formatMinutesAsHours(sh.workedMinutes),
+    'Horas Extras (min)': sh.overtimeMinutes ?? '',
+    'Horas Extras': formatMinutesAsHours(sh.overtimeMinutes),
+  }));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(shiftRows), 'Jornadas y Extras');
 
   const stayRows = report.locationStays.map((s) => ({
     Fecha: s.date,

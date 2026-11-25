@@ -13,6 +13,7 @@ import {
   Square,
   Truck,
   UploadCloud,
+  Utensils,
   Wifi,
 } from 'lucide-react';
 import { ApiError, apiFetch, setAuthToken } from '../lib/api.ts';
@@ -99,6 +100,7 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
   );
   const [confirmFinish, setConfirmFinish] = useState(false);
   const [elapsedText, setElapsedText] = useState('00:00:00');
+  const [lunchElapsedText, setLunchElapsedText] = useState('00:00:00');
   const [logoError, setLogoError] = useState(false);
 
   const syncingRef = useRef(false);
@@ -330,6 +332,8 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
   const effectiveShift = useMemo(() => {
     let active = status?.shiftActive ?? false;
     let startedAt = status?.shiftStartedAt ?? null;
+    let onLunch = status?.onLunch ?? false;
+    let lunchStartedAt = status?.lunchStartedAt ?? null;
     let vehicleId: number | null = status?.activeVehicle?.id ?? null;
     let vehicleCode: string | null = status?.activeVehicle?.code ?? null;
     let vehiclePlate: string | null = status?.activeVehicle?.plate ?? null;
@@ -346,12 +350,22 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
       if (ev.event_type === 'INICIO_JORNADA') {
         active = true;
         startedAt = ev.recorded_at;
+        onLunch = false;
+        lunchStartedAt = null;
         vehicleId = ev.vehicle_id ?? vehicleId;
         vehicleCode = ev.vehicle_code ?? vehicleCode;
         vehiclePlate = ev.vehicle_plate ?? vehiclePlate;
+      } else if (ev.event_type === 'INICIO_ALMUERZO') {
+        onLunch = true;
+        lunchStartedAt = ev.recorded_at;
+      } else if (ev.event_type === 'FIN_ALMUERZO') {
+        onLunch = false;
+        lunchStartedAt = null;
       } else if (ev.event_type === 'FIN_JORNADA') {
         active = false;
         startedAt = null;
+        onLunch = false;
+        lunchStartedAt = null;
         vehicleId = null;
         vehicleCode = null;
         vehiclePlate = null;
@@ -361,6 +375,8 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
     return {
       shiftActive: active,
       shiftStartedAt: startedAt,
+      onLunch,
+      lunchStartedAt,
       vehicleId,
       vehicleCode,
       vehiclePlate,
@@ -368,6 +384,8 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
   }, [
     status?.shiftActive,
     status?.shiftStartedAt,
+    status?.onLunch,
+    status?.lunchStartedAt,
     status?.activeVehicle,
     status?.todayEvents,
     pendingQueue.events,
@@ -446,6 +464,30 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
     const timer = setInterval(updateTimer, 1000);
     return () => clearInterval(timer);
   }, [effectiveShift.shiftActive, effectiveShift.shiftStartedAt]);
+
+  // Live elapsed lunch clock
+  useEffect(() => {
+    if (!effectiveShift.shiftActive || !effectiveShift.onLunch || !effectiveShift.lunchStartedAt) {
+      setLunchElapsedText('00:00:00');
+      return;
+    }
+    const updateLunchTimer = () => {
+      const diffMs = Math.max(
+        0,
+        Date.now() - new Date(effectiveShift.lunchStartedAt!).getTime()
+      );
+      const totalSec = Math.floor(diffMs / 1000);
+      const h = Math.floor(totalSec / 3600);
+      const m = Math.floor((totalSec % 3600) / 60);
+      const s = totalSec % 60;
+      setLunchElapsedText(
+        `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+      );
+    };
+    updateLunchTimer();
+    const timer = setInterval(updateLunchTimer, 1000);
+    return () => clearInterval(timer);
+  }, [effectiveShift.shiftActive, effectiveShift.onLunch, effectiveShift.lunchStartedAt]);
 
   // Automatic background GPS route tracking & geofence detection while on shift (works offline too)
   useEffect(() => {
@@ -757,12 +799,21 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
                   <p className="text-xs font-medium text-slate-500">Estado Actual</p>
                   <div className="mt-1 flex items-center gap-2.5">
                     {effectiveShift.shiftActive ? (
-                      <>
-                        <CheckCircle2 className="w-6 h-6 text-emerald-600 shrink-0" />
-                        <span className="text-xl font-bold text-emerald-700">
-                          Jornada Activa
-                        </span>
-                      </>
+                      effectiveShift.onLunch ? (
+                        <>
+                          <Utensils className="w-6 h-6 text-amber-600 shrink-0" />
+                          <span className="text-xl font-bold text-amber-700">
+                            En Almuerzo
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <CheckCircle2 className="w-6 h-6 text-emerald-600 shrink-0" />
+                          <span className="text-xl font-bold text-emerald-700">
+                            Jornada Activa
+                          </span>
+                        </>
+                      )
                     ) : (
                       <>
                         <Clock className="w-6 h-6 text-slate-400 shrink-0" />
@@ -772,14 +823,24 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
                       </>
                     )}
                   </div>
+                  <p className="mt-1 text-xs text-slate-500">
+                    Jornada diaria estándar: <span className="font-mono font-semibold text-slate-700">{status?.dailyWorkHours ?? 8}h</span> (el almuerzo no cuenta dentro de la jornada)
+                  </p>
                 </div>
 
                 {effectiveShift.shiftActive && (
                   <div className="text-right">
-                    <p className="text-xs font-medium text-slate-500">Tiempo en Jornada</p>
-                    <p className="mt-0.5 text-2xl font-bold font-mono tabular-nums text-slate-900">
-                      {elapsedText}
+                    <p className="text-xs font-medium text-slate-500">
+                      {effectiveShift.onLunch ? 'Tiempo en Almuerzo' : 'Tiempo en Jornada'}
                     </p>
+                    <p className={`mt-0.5 text-2xl font-bold font-mono tabular-nums ${effectiveShift.onLunch ? 'text-amber-700' : 'text-slate-900'}`}>
+                      {effectiveShift.onLunch ? lunchElapsedText : elapsedText}
+                    </p>
+                    {effectiveShift.onLunch && (
+                      <p className="text-[11px] font-mono text-slate-500">
+                        Total turno: {elapsedText}
+                      </p>
+                    )}
                   </div>
                 )}
               </div>
@@ -905,27 +966,62 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
                 </div>
               ) : (
                 <div className="space-y-5">
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <button
-                      type="button"
-                      disabled={submitting}
-                      onClick={() => registerEvent('ENTRADA')}
-                      className="min-h-[84px] rounded-2xl bg-emerald-700 hover:bg-emerald-800 active:scale-[0.99] text-white text-xl font-bold flex items-center justify-center gap-3 transition-transform disabled:opacity-60 cursor-pointer"
-                    >
-                      <LogIn className="w-7 h-7" />
-                      <span>Registrar Entrada</span>
-                    </button>
+                  {effectiveShift.onLunch ? (
+                    <div className="bg-amber-50 border border-amber-300 rounded-2xl p-4 space-y-3">
+                      <div className="flex items-start gap-2.5 text-amber-950">
+                        <Utensils className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+                        <div className="text-sm">
+                          <p className="font-bold">Estás en horario de almuerzo</p>
+                          <p className="text-xs text-amber-900 mt-0.5">
+                            Este tiempo no cuenta dentro de las {status?.dailyWorkHours ?? 8}h laborales. Presiona el botón cuando retomes tus labores.
+                          </p>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={submitting}
+                        onClick={() => registerEvent('FIN_ALMUERZO')}
+                        className="w-full min-h-[76px] rounded-2xl bg-amber-600 hover:bg-amber-700 active:scale-[0.99] text-white text-xl font-bold flex items-center justify-center gap-3 transition-transform disabled:opacity-60 cursor-pointer"
+                      >
+                        <Utensils className="w-6 h-6" />
+                        <span>{submitting ? 'Registrando...' : 'Finalizar Almuerzo'}</span>
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <button
+                          type="button"
+                          disabled={submitting}
+                          onClick={() => registerEvent('ENTRADA')}
+                          className="min-h-[84px] rounded-2xl bg-emerald-700 hover:bg-emerald-800 active:scale-[0.99] text-white text-xl font-bold flex items-center justify-center gap-3 transition-transform disabled:opacity-60 cursor-pointer"
+                        >
+                          <LogIn className="w-7 h-7" />
+                          <span>Registrar Entrada</span>
+                        </button>
 
-                    <button
-                      type="button"
-                      disabled={submitting}
-                      onClick={() => registerEvent('SALIDA')}
-                      className="min-h-[84px] rounded-2xl bg-yellow-400 hover:bg-yellow-300 active:scale-[0.99] text-emerald-950 text-xl font-bold flex items-center justify-center gap-3 transition-transform disabled:opacity-60 cursor-pointer border border-yellow-500/40"
-                    >
-                      <LogOut className="w-7 h-7" />
-                      <span>Registrar Salida</span>
-                    </button>
-                  </div>
+                        <button
+                          type="button"
+                          disabled={submitting}
+                          onClick={() => registerEvent('SALIDA')}
+                          className="min-h-[84px] rounded-2xl bg-yellow-400 hover:bg-yellow-300 active:scale-[0.99] text-emerald-950 text-xl font-bold flex items-center justify-center gap-3 transition-transform disabled:opacity-60 cursor-pointer border border-yellow-500/40"
+                        >
+                          <LogOut className="w-7 h-7" />
+                          <span>Registrar Salida</span>
+                        </button>
+                      </div>
+
+                      <button
+                        type="button"
+                        disabled={submitting}
+                        onClick={() => registerEvent('INICIO_ALMUERZO')}
+                        className="w-full min-h-[58px] rounded-xl bg-amber-50 hover:bg-amber-100 active:scale-[0.99] border-2 border-amber-300 text-amber-950 text-base font-bold flex items-center justify-center gap-2.5 transition-colors disabled:opacity-60 cursor-pointer"
+                      >
+                        <Utensils className="w-5 h-5 text-amber-700" />
+                        <span>Salir a Almorzar (no cuenta en jornada)</span>
+                      </button>
+                    </>
+                  )}
 
                   {/* Optional Observations */}
                   <div className="pt-2 border-t border-slate-100">
@@ -1006,7 +1102,10 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
                                   ? 'text-emerald-700'
                                   : ev.event_type === 'SALIDA'
                                     ? 'text-amber-700'
-                                    : 'text-red-700'
+                                    : ev.event_type === 'INICIO_ALMUERZO' ||
+                                        ev.event_type === 'FIN_ALMUERZO'
+                                      ? 'text-orange-700'
+                                      : 'text-red-700'
                             }`}
                           >
                             {formatEventLabel(ev.event_type)}

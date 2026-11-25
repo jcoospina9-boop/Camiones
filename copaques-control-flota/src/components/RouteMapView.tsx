@@ -65,6 +65,9 @@ function markerColor(type: FleetEvent['event_type']): string {
       return '#15803d';
     case 'SALIDA':
       return '#eab308';
+    case 'INICIO_ALMUERZO':
+    case 'FIN_ALMUERZO':
+      return '#ea580c';
     case 'FIN_JORNADA':
       return '#dc2626';
   }

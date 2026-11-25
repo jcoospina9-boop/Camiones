@@ -42,7 +42,14 @@ app.use((_req, res, next) => {
   next();
 });
 
-const VALID_EVENT_TYPES = ['INICIO_JORNADA', 'FIN_JORNADA', 'ENTRADA', 'SALIDA'] as const;
+const VALID_EVENT_TYPES = [
+  'INICIO_JORNADA',
+  'FIN_JORNADA',
+  'ENTRADA',
+  'SALIDA',
+  'INICIO_ALMUERZO',
+  'FIN_ALMUERZO',
+] as const;
 const VALID_CATEGORIES = ['Planta', 'Cliente', 'Obra', 'Bodega', 'Proveedor', 'Otro'] as const;
 
 interface SedeRow {
@@ -98,7 +105,13 @@ interface EventRow {
   vehicle_plate_snapshot: string;
   sede_id: number | null;
   sede_name_snapshot: string;
-  event_type: 'INICIO_JORNADA' | 'FIN_JORNADA' | 'ENTRADA' | 'SALIDA';
+  event_type:
+    | 'INICIO_JORNADA'
+    | 'FIN_JORNADA'
+    | 'ENTRADA'
+    | 'SALIDA'
+    | 'INICIO_ALMUERZO'
+    | 'FIN_ALMUERZO';
   source: 'MANUAL' | 'GEOCERCA_AUTO';
   geofence_id: number | null;
   geofence_name_snapshot: string | null;
@@ -245,6 +258,35 @@ function validateDriverCode(raw: unknown): string | null {
   const clean = raw.trim().toUpperCase();
   if (!/^[A-Z0-9_-]{2,20}$/.test(clean)) return null;
   return clean;
+}
+
+function getDailyWorkHours(): number {
+  const row = db
+    .prepare("SELECT value FROM app_settings WHERE key = 'daily_work_hours'")
+    .get() as { value: string } | undefined;
+  const parsed = row ? Number(row.value) : 8;
+  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 24) return 8;
+  return Math.round(parsed * 100) / 100;
+}
+
+function getDriverLunchState(
+  userId: number,
+  shiftStartedAt: string | null
+): { onLunch: boolean; lunchStartedAt: string | null } {
+  if (!shiftStartedAt) return { onLunch: false, lunchStartedAt: null };
+  const lastLunchEv = db
+    .prepare(
+      `SELECT event_type, recorded_at FROM events
+       WHERE user_id = ? AND recorded_at >= ? AND event_type IN ('INICIO_ALMUERZO', 'FIN_ALMUERZO')
+       ORDER BY recorded_at DESC, id DESC LIMIT 1`
+    )
+    .get(userId, shiftStartedAt) as
+    | { event_type: 'INICIO_ALMUERZO' | 'FIN_ALMUERZO'; recorded_at: string }
+    | undefined;
+  if (lastLunchEv && lastLunchEv.event_type === 'INICIO_ALMUERZO') {
+    return { onLunch: true, lunchStartedAt: lastLunchEv.recorded_at };
+  }
+  return { onLunch: false, lunchStartedAt: null };
 }
 
 function getVehicleShiftStatus(vehicleId: number): {
@@ -634,10 +676,17 @@ app.get('/api/driver/status', requireAuth, (req: AuthedRequest, res: Response) =
       : db.prepare('SELECT COUNT(*) AS cnt FROM geofences WHERE active = 1').get()
   ) as { cnt: number };
 
+  const lunchState = driverShift.shiftActive
+    ? getDriverLunchState(user.id, driverShift.shiftStartedAt)
+    : { onLunch: false, lunchStartedAt: null };
+
   res.json({
     hasVehicle: Boolean(activeVehicle || availableVehicles.length > 0),
     shiftActive: driverShift.shiftActive,
     shiftStartedAt: driverShift.shiftStartedAt,
+    onLunch: lunchState.onLunch,
+    lunchStartedAt: lunchState.lunchStartedAt,
+    dailyWorkHours: getDailyWorkHours(),
     activeVehicle,
     availableVehicles,
     currentGeofence,
@@ -763,6 +812,21 @@ app.post('/api/driver/events', requireAuth, async (req: AuthedRequest, res: Resp
       res.status(400).json({ error: 'Debes iniciar jornada seleccionando un camión antes de registrar movimientos.' });
       return;
     }
+
+    const lunchState = getDriverLunchState(user.id, driverShift.shiftStartedAt);
+    if (event_type === 'INICIO_ALMUERZO' && lunchState.onLunch) {
+      res.status(400).json({ error: 'Ya iniciaste tu hora de almuerzo. Presiona "Finalizar Almuerzo" al regresar.' });
+      return;
+    }
+    if (event_type === 'FIN_ALMUERZO' && !lunchState.onLunch) {
+      res.status(400).json({ error: 'No tienes un almuerzo activo para finalizar.' });
+      return;
+    }
+    if ((event_type === 'ENTRADA' || event_type === 'SALIDA') && lunchState.onLunch) {
+      res.status(400).json({ error: 'Estás en hora de almuerzo. Finaliza el almuerzo antes de registrar entradas o salidas.' });
+      return;
+    }
+
     targetVehicle = {
       id: driverShift.vehicleId,
       code: driverShift.vehicleCode ?? '',
@@ -839,6 +903,22 @@ app.post('/api/driver/events', requireAuth, async (req: AuthedRequest, res: Resp
            last_lng = excluded.last_lng,
            updated_at = excluded.updated_at`
       ).run(targetVehicle!.id, coords.lat, coords.lng, recordedAt);
+    } else if (event_type === 'INICIO_ALMUERZO' || event_type === 'FIN_ALMUERZO') {
+      db.prepare(
+        `INSERT INTO driver_geofence_state (vehicle_id, current_geofence_id, entered_at, last_lat, last_lng, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(vehicle_id) DO UPDATE SET
+           last_lat = excluded.last_lat,
+           last_lng = excluded.last_lng,
+           updated_at = excluded.updated_at`
+      ).run(
+        targetVehicle!.id,
+        matchedGf ? matchedGf.id : null,
+        matchedGf ? recordedAt : null,
+        coords.lat,
+        coords.lng,
+        recordedAt
+      );
     } else {
       db.prepare(
         `INSERT INTO driver_geofence_state (vehicle_id, current_geofence_id, entered_at, last_lat, last_lng, updated_at)
@@ -1171,6 +1251,40 @@ app.post('/api/driver/sync-offline', requireAuth, async (req: AuthedRequest, res
         return { ok: false as const, reason: 'No había una jornada activa en ese horario.' };
       }
 
+      if (activeBefore) {
+        const lastShiftStart = db
+          .prepare(
+            `SELECT recorded_at FROM events
+             WHERE user_id = ? AND recorded_at <= ? AND event_type = 'INICIO_JORNADA'
+             ORDER BY recorded_at DESC, id DESC LIMIT 1`
+          )
+          .get(user.id, recordedAt) as { recorded_at: string } | undefined;
+
+        const lastLunch = lastShiftStart
+          ? (db
+              .prepare(
+                `SELECT event_type FROM events
+                 WHERE user_id = ? AND recorded_at >= ? AND recorded_at <= ?
+                   AND event_type IN ('INICIO_ALMUERZO', 'FIN_ALMUERZO')
+                 ORDER BY recorded_at DESC, id DESC LIMIT 1`
+              )
+              .get(user.id, lastShiftStart.recorded_at, recordedAt) as
+              | { event_type: 'INICIO_ALMUERZO' | 'FIN_ALMUERZO' }
+              | undefined)
+          : undefined;
+        const onLunchBefore = lastLunch?.event_type === 'INICIO_ALMUERZO';
+
+        if (eventType === 'INICIO_ALMUERZO' && onLunchBefore) {
+          return { ok: false as const, reason: 'Ya existía un almuerzo activo en ese horario.' };
+        }
+        if (eventType === 'FIN_ALMUERZO' && !onLunchBefore) {
+          return { ok: false as const, reason: 'No había un almuerzo activo para finalizar en ese horario.' };
+        }
+        if ((eventType === 'ENTRADA' || eventType === 'SALIDA') && onLunchBefore) {
+          return { ok: false as const, reason: 'No se puede registrar entrada/salida durante el almuerzo.' };
+        }
+      }
+
       db.prepare(
         `INSERT INTO events (
           event_uuid, event_date, event_time, recorded_at,
@@ -1238,6 +1352,22 @@ app.post('/api/driver/sync-offline', requireAuth, async (req: AuthedRequest, res
                last_lng = excluded.last_lng,
                updated_at = excluded.updated_at`
           ).run(resolvedVehicle!.id, coords.lat, coords.lng, recordedAt);
+        } else if (eventType === 'INICIO_ALMUERZO' || eventType === 'FIN_ALMUERZO') {
+          db.prepare(
+            `INSERT INTO driver_geofence_state (vehicle_id, current_geofence_id, entered_at, last_lat, last_lng, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(vehicle_id) DO UPDATE SET
+               last_lat = excluded.last_lat,
+               last_lng = excluded.last_lng,
+               updated_at = excluded.updated_at`
+          ).run(
+            resolvedVehicle!.id,
+            matchedGf ? matchedGf.id : null,
+            matchedGf ? recordedAt : null,
+            coords.lat,
+            coords.lng,
+            recordedAt
+          );
         } else {
           db.prepare(
             `INSERT INTO driver_geofence_state (vehicle_id, current_geofence_id, entered_at, last_lat, last_lng, updated_at)
@@ -1856,23 +1986,51 @@ app.get('/api/admin/route', requireAuth, requireRole('GERENCIA', 'ADMIN'), (req:
 
   let shiftDurationMinutes = 0;
   let shiftStart: Date | null = null;
+  let lunchStart: Date | null = null;
+  let shiftLunchMinutes = 0;
   for (const ev of events) {
     if (ev.event_type === 'INICIO_JORNADA' && !shiftStart) {
       shiftStart = new Date(ev.recorded_at);
+      lunchStart = null;
+      shiftLunchMinutes = 0;
+    } else if (ev.event_type === 'INICIO_ALMUERZO' && shiftStart && !lunchStart) {
+      lunchStart = new Date(ev.recorded_at);
+    } else if (ev.event_type === 'FIN_ALMUERZO' && shiftStart && lunchStart) {
+      shiftLunchMinutes += Math.max(
+        0,
+        Math.round((new Date(ev.recorded_at).getTime() - lunchStart.getTime()) / 60000)
+      );
+      lunchStart = null;
     } else if (ev.event_type === 'FIN_JORNADA' && shiftStart) {
-      shiftDurationMinutes += Math.max(
+      if (lunchStart) {
+        shiftLunchMinutes += Math.max(
+          0,
+          Math.round((new Date(ev.recorded_at).getTime() - lunchStart.getTime()) / 60000)
+        );
+        lunchStart = null;
+      }
+      const gross = Math.max(
         0,
         Math.round((new Date(ev.recorded_at).getTime() - shiftStart.getTime()) / 60000)
       );
+      shiftDurationMinutes += Math.max(0, gross - shiftLunchMinutes);
       shiftStart = null;
+      shiftLunchMinutes = 0;
     }
   }
   if (shiftStart && events.length > 0) {
     const lastEv = events[events.length - 1];
-    shiftDurationMinutes += Math.max(
+    if (lunchStart) {
+      shiftLunchMinutes += Math.max(
+        0,
+        Math.round((new Date(lastEv.recorded_at).getTime() - lunchStart.getTime()) / 60000)
+      );
+    }
+    const gross = Math.max(
       0,
       Math.round((new Date(lastEv.recorded_at).getTime() - shiftStart.getTime()) / 60000)
     );
+    shiftDurationMinutes += Math.max(0, gross - shiftLunchMinutes);
   }
 
   const geofences = vehicle.sede_id
@@ -2871,8 +3029,33 @@ app.delete('/api/admin/users/:id', requireAuth, requireRole('GERENCIA', 'ADMIN')
 });
 
 // ==========================================
-// REPORTS ENGINE
+// SETTINGS & REPORTS ENGINE
 // ==========================================
+
+app.get('/api/admin/settings', requireAuth, requireRole('GERENCIA', 'ADMIN'), (_req: AuthedRequest, res: Response) => {
+  res.json({ dailyWorkHours: getDailyWorkHours() });
+});
+
+app.put('/api/admin/settings', requireAuth, requireRole('GERENCIA'), (req: AuthedRequest, res: Response) => {
+  const rawHours = Number(req.body?.dailyWorkHours);
+  if (!Number.isFinite(rawHours) || rawHours < 1 || rawHours > 24) {
+    res.status(400).json({ error: 'Las horas diarias laborales deben estar entre 1 y 24 horas.' });
+    return;
+  }
+  const rounded = Math.round(rawHours * 100) / 100;
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO app_settings (key, value, updated_at, updated_by)
+     VALUES ('daily_work_hours', ?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET
+       value = excluded.value,
+       updated_at = excluded.updated_at,
+       updated_by = excluded.updated_by`
+  ).run(String(rounded), now, req.user!.id);
+
+  logAudit(req.user!.id, 'SETTINGS_UPDATE', `Jornada diaria laboral actualizada a ${rounded} hora(s)`);
+  res.json({ dailyWorkHours: rounded });
+});
 
 app.get('/api/admin/reports', requireAuth, requireRole('GERENCIA', 'ADMIN'), (req: AuthedRequest, res: Response) => {
   const { eventDate: today } = getServerDateParts();
@@ -2887,6 +3070,9 @@ app.get('/api/admin/reports', requireAuth, requireRole('GERENCIA', 'ADMIN'), (re
   const scopedSedeId = resolveScopedSedeId(req.user!, req.query.sedeId);
   const vehicleId = req.query.vehicleId ? Number(req.query.vehicleId) : null;
   const userId = req.query.userId ? Number(req.query.userId) : null;
+
+  const dailyWorkHours = getDailyWorkHours();
+  const dailyTargetMinutes = Math.round(dailyWorkHours * 60);
 
   const conditions = ['event_date >= ?', 'event_date <= ?'];
   const params: unknown[] = [startDate, endDate];
@@ -2921,7 +3107,24 @@ app.get('/api/admin/reports', requireAuth, requireRole('GERENCIA', 'ADMIN'), (re
     exitsCount: number;
     shiftsCount: number;
     workedMinutes: number;
+    lunchMinutes: number;
+    overtimeMinutes: number;
     stayMinutes: number;
+  }
+
+  interface ShiftDetail {
+    date: string;
+    driverName: string;
+    driverCode: string;
+    username: string;
+    vehicleCode: string;
+    vehiclePlate: string;
+    startTime: string;
+    endTime: string | null;
+    grossMinutes: number | null;
+    lunchMinutes: number;
+    workedMinutes: number | null;
+    overtimeMinutes: number | null;
   }
 
   interface LocationStay {
@@ -2937,6 +3140,8 @@ app.get('/api/admin/reports', requireAuth, requireRole('GERENCIA', 'ADMIN'), (re
 
   const byVehicleMap = new Map<string, AggRow>();
   const byDriverMap = new Map<string, AggRow>();
+  const driverDayWorkedMap = new Map<string, number>();
+  const shifts: ShiftDetail[] = [];
   const locationStays: LocationStay[] = [];
 
   const eventsByVehicle = new Map<string, EventRow[]>();
@@ -2958,12 +3163,16 @@ app.get('/api/admin/reports', requireAuth, requireRole('GERENCIA', 'ADMIN'), (re
         exitsCount: 0,
         shiftsCount: 0,
         workedMinutes: 0,
+        lunchMinutes: 0,
+        overtimeMinutes: 0,
         stayMinutes: 0,
       });
     }
     const vAgg = byVehicleMap.get(vKey)!;
 
     let openShift: EventRow | null = null;
+    let openLunch: EventRow | null = null;
+    let shiftLunchMins = 0;
     let openEntry: EventRow | null = null;
 
     for (const ev of vEvents) {
@@ -2978,6 +3187,8 @@ app.get('/api/admin/reports', requireAuth, requireRole('GERENCIA', 'ADMIN'), (re
           exitsCount: 0,
           shiftsCount: 0,
           workedMinutes: 0,
+          lunchMinutes: 0,
+          overtimeMinutes: 0,
           stayMinutes: 0,
         });
       }
@@ -2990,16 +3201,76 @@ app.get('/api/admin/reports', requireAuth, requireRole('GERENCIA', 'ADMIN'), (re
         vAgg.shiftsCount++;
         dAgg.shiftsCount++;
         openShift = ev;
+        openLunch = null;
+        shiftLunchMins = 0;
+      } else if (ev.event_type === 'INICIO_ALMUERZO') {
+        if (openShift && !openLunch) {
+          openLunch = ev;
+        }
+      } else if (ev.event_type === 'FIN_ALMUERZO') {
+        if (openShift && openLunch) {
+          const lunchInterval = Math.max(
+            0,
+            Math.round((new Date(ev.recorded_at).getTime() - new Date(openLunch.recorded_at).getTime()) / 60000)
+          );
+          shiftLunchMins += lunchInterval;
+          vAgg.lunchMinutes += lunchInterval;
+          const lunchDriverAgg = byDriverMap.get(openShift.username_snapshot);
+          if (lunchDriverAgg) lunchDriverAgg.lunchMinutes += lunchInterval;
+          openLunch = null;
+        }
       } else if (ev.event_type === 'FIN_JORNADA') {
         if (openShift) {
-          const mins = Math.max(
+          if (openLunch) {
+            const lunchInterval = Math.max(
+              0,
+              Math.round((new Date(ev.recorded_at).getTime() - new Date(openLunch.recorded_at).getTime()) / 60000)
+            );
+            shiftLunchMins += lunchInterval;
+            vAgg.lunchMinutes += lunchInterval;
+            const lunchDriverAgg = byDriverMap.get(openShift.username_snapshot);
+            if (lunchDriverAgg) lunchDriverAgg.lunchMinutes += lunchInterval;
+            openLunch = null;
+          }
+
+          const grossMins = Math.max(
             0,
             Math.round((new Date(ev.recorded_at).getTime() - new Date(openShift.recorded_at).getTime()) / 60000)
           );
-          vAgg.workedMinutes += mins;
+          const netWorkedMins = Math.max(0, grossMins - shiftLunchMins);
+          const shiftOvertimeMins = Math.max(0, netWorkedMins - dailyTargetMinutes);
+
+          vAgg.workedMinutes += netWorkedMins;
+          vAgg.overtimeMinutes += shiftOvertimeMins;
+
           const openDriverAgg = byDriverMap.get(openShift.username_snapshot);
-          if (openDriverAgg) openDriverAgg.workedMinutes += mins;
+          if (openDriverAgg) {
+            openDriverAgg.workedMinutes += netWorkedMins;
+          }
+
+          const driverDayKey = `${openShift.username_snapshot}|${openShift.event_date}`;
+          driverDayWorkedMap.set(
+            driverDayKey,
+            (driverDayWorkedMap.get(driverDayKey) ?? 0) + netWorkedMins
+          );
+
+          shifts.push({
+            date: openShift.event_date,
+            driverName: openShift.driver_name_snapshot,
+            driverCode: openShift.driver_code_snapshot ?? '',
+            username: openShift.username_snapshot,
+            vehicleCode: vCode,
+            vehiclePlate: vPlate,
+            startTime: `${openShift.event_date} ${openShift.event_time}`,
+            endTime: `${ev.event_date} ${ev.event_time}`,
+            grossMinutes: grossMins,
+            lunchMinutes: shiftLunchMins,
+            workedMinutes: netWorkedMins,
+            overtimeMinutes: shiftOvertimeMins,
+          });
+
           openShift = null;
+          shiftLunchMins = 0;
         }
         if (openEntry) {
           const stayMins = Math.max(
@@ -3051,6 +3322,23 @@ app.get('/api/admin/reports', requireAuth, requireRole('GERENCIA', 'ADMIN'), (re
       }
     }
 
+    if (openShift) {
+      shifts.push({
+        date: openShift.event_date,
+        driverName: openShift.driver_name_snapshot,
+        driverCode: openShift.driver_code_snapshot ?? '',
+        username: openShift.username_snapshot,
+        vehicleCode: vCode,
+        vehiclePlate: vPlate,
+        startTime: `${openShift.event_date} ${openShift.event_time}`,
+        endTime: null,
+        grossMinutes: null,
+        lunchMinutes: shiftLunchMins,
+        workedMinutes: null,
+        overtimeMinutes: null,
+      });
+    }
+
     if (openEntry) {
       locationStays.push({
         vehicleCode: vCode,
@@ -3065,22 +3353,38 @@ app.get('/api/admin/reports', requireAuth, requireRole('GERENCIA', 'ADMIN'), (re
     }
   }
 
+  // Compute daily overtime per driver across each date worked
+  for (const [driverDayKey, dayNetWorked] of driverDayWorkedMap.entries()) {
+    const sepIdx = driverDayKey.lastIndexOf('|');
+    const username = driverDayKey.slice(0, sepIdx);
+    const dayOvertime = Math.max(0, dayNetWorked - dailyTargetMinutes);
+    const dAgg = byDriverMap.get(username);
+    if (dAgg && dayOvertime > 0) {
+      dAgg.overtimeMinutes += dayOvertime;
+    }
+  }
+
   const byVehicle = Array.from(byVehicleMap.values());
   const byDriver = Array.from(byDriverMap.values());
 
   const summary = {
     startDate,
     endDate,
+    dailyWorkHours,
     totalEvents: events.length,
     totalVisits: events.filter((e) => e.event_type === 'ENTRADA').length,
     totalShifts: events.filter((e) => e.event_type === 'INICIO_JORNADA').length,
     totalWorkedHours:
       Math.round((byVehicle.reduce((acc, r) => acc + r.workedMinutes, 0) / 60) * 100) / 100,
+    totalLunchHours:
+      Math.round((byVehicle.reduce((acc, r) => acc + r.lunchMinutes, 0) / 60) * 100) / 100,
+    totalOvertimeHours:
+      Math.round((byDriver.reduce((acc, r) => acc + r.overtimeMinutes, 0) / 60) * 100) / 100,
     totalStayHours:
       Math.round((byVehicle.reduce((acc, r) => acc + r.stayMinutes, 0) / 60) * 100) / 100,
   };
 
-  res.json({ summary, byVehicle, byDriver, locationStays, events });
+  res.json({ summary, byVehicle, byDriver, shifts, locationStays, events });
 });
 
 // ==========================================
@@ -3110,6 +3414,7 @@ app.get('/api/admin/backup/export', requireAuth, requireRole('GERENCIA'), async 
     exportedAt: new Date().toISOString(),
     exportedBy: req.user!.username,
     tables: {
+      app_settings: db.prepare('SELECT * FROM app_settings').all(),
       sedes: db.prepare('SELECT * FROM sedes').all(),
       vehicles: db.prepare('SELECT * FROM vehicles').all(),
       users: db.prepare('SELECT * FROM users').all(),

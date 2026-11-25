@@ -1,6 +1,12 @@
 export type UserRole = 'CONDUCTOR' | 'ADMIN' | 'GERENCIA';
 
-export type EventType = 'INICIO_JORNADA' | 'FIN_JORNADA' | 'ENTRADA' | 'SALIDA';
+export type EventType =
+  | 'INICIO_JORNADA'
+  | 'FIN_JORNADA'
+  | 'ENTRADA'
+  | 'SALIDA'
+  | 'INICIO_ALMUERZO'
+  | 'FIN_ALMUERZO';
 
 export type EventSource = 'MANUAL' | 'GEOCERCA_AUTO';
 
@@ -153,6 +159,9 @@ export interface DriverStatusResponse {
   hasVehicle: boolean;
   shiftActive: boolean;
   shiftStartedAt: string | null;
+  onLunch: boolean;
+  lunchStartedAt: string | null;
+  dailyWorkHours: number;
   activeVehicle: {
     id: number;
     code: string;
@@ -235,7 +244,24 @@ export interface ReportAggRow {
   exitsCount: number;
   shiftsCount: number;
   workedMinutes: number;
+  lunchMinutes: number;
+  overtimeMinutes: number;
   stayMinutes: number;
+}
+
+export interface ShiftDetailRow {
+  date: string;
+  driverName: string;
+  driverCode: string;
+  username: string;
+  vehicleCode: string;
+  vehiclePlate: string;
+  startTime: string;
+  endTime: string | null;
+  grossMinutes: number | null;
+  lunchMinutes: number;
+  workedMinutes: number | null;
+  overtimeMinutes: number | null;
 }
 
 export interface LocationStayRow {
@@ -253,14 +279,18 @@ export interface ReportResponse {
   summary: {
     startDate: string;
     endDate: string;
+    dailyWorkHours: number;
     totalEvents: number;
     totalVisits: number;
     totalShifts: number;
     totalWorkedHours: number;
+    totalLunchHours: number;
+    totalOvertimeHours: number;
     totalStayHours: number;
   };
   byVehicle: ReportAggRow[];
   byDriver: ReportAggRow[];
+  shifts: ShiftDetailRow[];
   locationStays: LocationStayRow[];
   events: FleetEvent[];
 }
@@ -285,6 +315,10 @@ export function formatEventLabel(type: EventType): string {
       return 'Entrada';
     case 'SALIDA':
       return 'Salida';
+    case 'INICIO_ALMUERZO':
+      return 'Inicio de Almuerzo';
+    case 'FIN_ALMUERZO':
+      return 'Fin de Almuerzo';
   }
 }
 

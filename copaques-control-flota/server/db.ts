@@ -87,6 +87,13 @@ export function initDatabase(): void {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL
+    );
+
     CREATE TABLE IF NOT EXISTS events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       event_uuid TEXT NOT NULL UNIQUE,
@@ -106,7 +113,7 @@ export function initDatabase(): void {
       vehicle_plate_snapshot TEXT NOT NULL,
       sede_id INTEGER REFERENCES sedes(id) ON DELETE SET NULL,
       sede_name_snapshot TEXT NOT NULL DEFAULT '',
-      event_type TEXT NOT NULL CHECK(event_type IN ('INICIO_JORNADA', 'FIN_JORNADA', 'ENTRADA', 'SALIDA')),
+      event_type TEXT NOT NULL CHECK(event_type IN ('INICIO_JORNADA', 'FIN_JORNADA', 'ENTRADA', 'SALIDA', 'INICIO_ALMUERZO', 'FIN_ALMUERZO')),
       source TEXT NOT NULL DEFAULT 'MANUAL' CHECK(source IN ('MANUAL', 'GEOCERCA_AUTO')),
       geofence_id INTEGER,
       geofence_name_snapshot TEXT,
@@ -171,6 +178,12 @@ export function initDatabase(): void {
     insertSede.run(s.name, s.code, s.latitude, s.longitude, now);
   }
 
+  // Seed default daily_work_hours setting (8h) idempotently
+  db.prepare(
+    `INSERT OR IGNORE INTO app_settings (key, value, updated_at)
+     VALUES ('daily_work_hours', '8', ?)`
+  ).run(now);
+
   // Incremental schema migrations for existing SQLite databases
   if (!hasColumn('vehicles', 'sede_id')) {
     db.exec('ALTER TABLE vehicles ADD COLUMN sede_id INTEGER REFERENCES sedes(id) ON DELETE SET NULL;');
@@ -198,6 +211,69 @@ export function initDatabase(): void {
   }
   if (!hasColumn('users', 'deleted_at')) {
     db.exec('ALTER TABLE users ADD COLUMN deleted_at TEXT;');
+  }
+
+  // Migrate events table if CHECK constraint lacks INICIO_ALMUERZO / FIN_ALMUERZO
+  const eventsMaster = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'")
+    .get() as { sql: string } | undefined;
+
+  if (eventsMaster && !eventsMaster.sql.includes("'INICIO_ALMUERZO'")) {
+    db.pragma('foreign_keys = OFF');
+    const migrateEventsTx = db.transaction(() => {
+      db.exec(`
+        CREATE TABLE events_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_uuid TEXT NOT NULL UNIQUE,
+          event_date TEXT NOT NULL,
+          event_time TEXT NOT NULL,
+          recorded_at TEXT NOT NULL,
+          latitude REAL NOT NULL,
+          longitude REAL NOT NULL,
+          accuracy_meters REAL,
+          address TEXT NOT NULL DEFAULT '',
+          user_id INTEGER NOT NULL REFERENCES users(id),
+          username_snapshot TEXT NOT NULL,
+          driver_name_snapshot TEXT NOT NULL,
+          driver_code_snapshot TEXT NOT NULL DEFAULT '',
+          vehicle_id INTEGER REFERENCES vehicles(id),
+          vehicle_code_snapshot TEXT NOT NULL,
+          vehicle_plate_snapshot TEXT NOT NULL,
+          sede_id INTEGER REFERENCES sedes(id) ON DELETE SET NULL,
+          sede_name_snapshot TEXT NOT NULL DEFAULT '',
+          event_type TEXT NOT NULL CHECK(event_type IN ('INICIO_JORNADA', 'FIN_JORNADA', 'ENTRADA', 'SALIDA', 'INICIO_ALMUERZO', 'FIN_ALMUERZO')),
+          source TEXT NOT NULL DEFAULT 'MANUAL' CHECK(source IN ('MANUAL', 'GEOCERCA_AUTO')),
+          geofence_id INTEGER,
+          geofence_name_snapshot TEXT,
+          notes TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL
+        );
+
+        INSERT INTO events_new (
+          id, event_uuid, event_date, event_time, recorded_at,
+          latitude, longitude, accuracy_meters, address,
+          user_id, username_snapshot, driver_name_snapshot, driver_code_snapshot,
+          vehicle_id, vehicle_code_snapshot, vehicle_plate_snapshot,
+          sede_id, sede_name_snapshot,
+          event_type, source, geofence_id, geofence_name_snapshot,
+          notes, created_at
+        )
+        SELECT
+          id, event_uuid, event_date, event_time, recorded_at,
+          latitude, longitude, accuracy_meters, address,
+          user_id, username_snapshot, driver_name_snapshot, driver_code_snapshot,
+          vehicle_id, vehicle_code_snapshot, vehicle_plate_snapshot,
+          sede_id, sede_name_snapshot,
+          event_type, source, geofence_id, geofence_name_snapshot,
+          notes, created_at
+        FROM events;
+
+        DROP TABLE events;
+        ALTER TABLE events_new RENAME TO events;
+      `);
+    });
+    migrateEventsTx();
+    db.pragma('foreign_keys = ON');
   }
 
   // Migrate users table if missing sede_id or missing ADMIN role in CHECK constraint
