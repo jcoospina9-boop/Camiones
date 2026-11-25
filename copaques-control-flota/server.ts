@@ -488,6 +488,27 @@ app.get('/api/driver/status', requireAuth, (req: AuthedRequest, res: Response) =
   });
 });
 
+function validateEventUuid(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!/^[a-zA-Z0-9_-]{8,64}$/.test(trimmed)) return null;
+  return trimmed;
+}
+
+function validateOfflineRecordedAt(raw: unknown): Date | null {
+  if (typeof raw !== 'string' || raw.trim().length === 0) return null;
+  const parsed = new Date(raw);
+  const ms = parsed.getTime();
+  if (!Number.isFinite(ms)) return null;
+  const now = Date.now();
+  const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+  const fiveMinFutureMs = 5 * 60 * 1000;
+  if (ms < now - thirtyDaysMs || ms > now + fiveMinFutureMs) {
+    return null;
+  }
+  return parsed;
+}
+
 app.post('/api/driver/events', requireAuth, async (req: AuthedRequest, res: Response) => {
   const user = req.user!;
   if (!user.vehicle_id || !user.vehicle_code || !user.vehicle_plate) {
@@ -497,7 +518,18 @@ app.post('/api/driver/events', requireAuth, async (req: AuthedRequest, res: Resp
     return;
   }
 
-  const { event_type, latitude, longitude, accuracy_meters, notes } = req.body ?? {};
+  const { event_type, latitude, longitude, accuracy_meters, notes, event_uuid } = req.body ?? {};
+  const clientUuid = validateEventUuid(event_uuid);
+  if (clientUuid) {
+    const existing = db
+      .prepare('SELECT * FROM events WHERE event_uuid = ? AND vehicle_id = ?')
+      .get(clientUuid, user.vehicle_id) as EventRow | undefined;
+    if (existing) {
+      res.json({ event: existing, matchedGeofence: null, deduplicated: true });
+      return;
+    }
+  }
+
   if (!VALID_EVENT_TYPES.includes(event_type)) {
     res.status(400).json({ error: 'Tipo de evento inválido.' });
     return;
@@ -532,7 +564,7 @@ app.post('/api/driver/events', requireAuth, async (req: AuthedRequest, res: Resp
   const matchedGf = findMatchingGeofence(coords.lat, coords.lng, vehicleSede.sede_id);
   const address = await reverseGeocode(coords.lat, coords.lng);
   const { eventDate, eventTime, recordedAt } = getServerDateParts();
-  const eventUuid = crypto.randomUUID();
+  const eventUuid = clientUuid ?? crypto.randomUUID();
 
   const insertTx = db.transaction(() => {
     const info = db
@@ -784,6 +816,286 @@ app.post('/api/driver/geofence-ping', requireAuth, async (req: AuthedRequest, re
     currentGeofence: matchedGf
       ? { id: matchedGf.id, name: matchedGf.name, category: matchedGf.category }
       : null,
+  });
+});
+
+app.post('/api/driver/sync-offline', requireAuth, async (req: AuthedRequest, res: Response) => {
+  const user = req.user!;
+  if (!user.vehicle_id || !user.vehicle_code || !user.vehicle_plate) {
+    res.status(400).json({
+      error: 'Tu usuario no tiene un camión asignado. Contacta al Administrador de tu sede o a Gerencia.',
+    });
+    return;
+  }
+
+  const rawEvents: unknown[] = Array.isArray(req.body?.events) ? req.body.events.slice(0, 200) : [];
+  const rawPoints: unknown[] = Array.isArray(req.body?.gpsPoints) ? req.body.gpsPoints.slice(0, 1000) : [];
+
+  const syncedEventUuids: string[] = [];
+  const rejectedEvents: Array<{ event_uuid: string; reason: string }> = [];
+  let syncedEventsCount = 0;
+  let syncedPointsCount = 0;
+
+  const vehicleSede = getVehicleSedeInfo(user.vehicle_id);
+
+  // Sort incoming events chronologically so shift state checks work cleanly in sequence
+  const normalizedEvents = rawEvents
+    .map((item) => (item && typeof item === 'object' ? (item as Record<string, unknown>) : null))
+    .filter((item): item is Record<string, unknown> => item !== null)
+    .sort((a, b) => {
+      const ta = typeof a.recorded_at === 'string' ? new Date(a.recorded_at).getTime() : 0;
+      const tb = typeof b.recorded_at === 'string' ? new Date(b.recorded_at).getTime() : 0;
+      return (Number.isFinite(ta) ? ta : 0) - (Number.isFinite(tb) ? tb : 0);
+    });
+
+  for (const item of normalizedEvents) {
+    const uuid = validateEventUuid(item.event_uuid);
+    if (!uuid) {
+      continue;
+    }
+
+    const existing = db
+      .prepare('SELECT id FROM events WHERE event_uuid = ?')
+      .get(uuid) as { id: number } | undefined;
+    if (existing) {
+      syncedEventUuids.push(uuid);
+      continue;
+    }
+
+    const eventType = item.event_type as EventRow['event_type'];
+    if (!VALID_EVENT_TYPES.includes(eventType)) {
+      rejectedEvents.push({ event_uuid: uuid, reason: 'Tipo de evento inválido.' });
+      continue;
+    }
+
+    const coords = validateCoords(item.latitude, item.longitude);
+    if (!coords) {
+      rejectedEvents.push({ event_uuid: uuid, reason: 'Coordenadas GPS inválidas.' });
+      continue;
+    }
+
+    const recordedDateObj = validateOfflineRecordedAt(item.recorded_at);
+    if (!recordedDateObj) {
+      rejectedEvents.push({ event_uuid: uuid, reason: 'Fecha u hora fuera de rango válido.' });
+      continue;
+    }
+
+    const cleanNotes = typeof item.notes === 'string' ? item.notes.trim().slice(0, 500) : '';
+    const cleanAccuracy =
+      typeof item.accuracy_meters === 'number' &&
+      Number.isFinite(item.accuracy_meters) &&
+      item.accuracy_meters >= 0
+        ? Math.round(item.accuracy_meters * 10) / 10
+        : null;
+
+    const { eventDate, eventTime, recordedAt } = getServerDateParts(recordedDateObj);
+    const matchedGf = findMatchingGeofence(coords.lat, coords.lng, vehicleSede.sede_id);
+    const address = await reverseGeocode(coords.lat, coords.lng);
+
+    const txResult = db.transaction(() => {
+      // Re-check idempotency inside transaction
+      const dup = db.prepare('SELECT id FROM events WHERE event_uuid = ?').get(uuid);
+      if (dup) {
+        return { ok: true as const, inserted: false };
+      }
+
+      // Check chronological shift state at the moment this offline event occurred
+      const priorEvent = db
+        .prepare(
+          'SELECT event_type FROM events WHERE vehicle_id = ? AND recorded_at <= ? ORDER BY recorded_at DESC, id DESC LIMIT 1'
+        )
+        .get(user.vehicle_id, recordedAt) as { event_type: EventRow['event_type'] } | undefined;
+
+      const activeBefore = Boolean(priorEvent && priorEvent.event_type !== 'FIN_JORNADA');
+      if (eventType === 'INICIO_JORNADA' && activeBefore) {
+        return { ok: false as const, reason: 'Ya existía una jornada activa en ese horario.' };
+      }
+      if (eventType !== 'INICIO_JORNADA' && !activeBefore) {
+        return { ok: false as const, reason: 'No había una jornada activa en ese horario.' };
+      }
+
+      db.prepare(
+        `INSERT INTO events (
+          event_uuid, event_date, event_time, recorded_at,
+          latitude, longitude, accuracy_meters, address,
+          user_id, username_snapshot, driver_name_snapshot,
+          vehicle_id, vehicle_code_snapshot, vehicle_plate_snapshot,
+          sede_id, sede_name_snapshot,
+          event_type, source, geofence_id, geofence_name_snapshot,
+          notes, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL', ?, ?, ?, ?)`
+      ).run(
+        uuid,
+        eventDate,
+        eventTime,
+        recordedAt,
+        coords.lat,
+        coords.lng,
+        cleanAccuracy,
+        address,
+        user.id,
+        user.username,
+        user.full_name,
+        user.vehicle_id,
+        user.vehicle_code,
+        user.vehicle_plate,
+        vehicleSede.sede_id,
+        vehicleSede.sede_name,
+        eventType,
+        matchedGf ? matchedGf.id : null,
+        matchedGf ? matchedGf.name : null,
+        cleanNotes,
+        new Date().toISOString()
+      );
+
+      const dupPt = db
+        .prepare('SELECT id FROM route_points WHERE vehicle_id = ? AND recorded_at = ? LIMIT 1')
+        .get(user.vehicle_id, recordedAt);
+      if (!dupPt) {
+        recordRoutePoint(
+          user.vehicle_id!,
+          user.id,
+          eventDate,
+          recordedAt,
+          coords.lat,
+          coords.lng,
+          cleanAccuracy,
+          true
+        );
+      }
+
+      const curState = db
+        .prepare('SELECT updated_at FROM driver_geofence_state WHERE vehicle_id = ?')
+        .get(user.vehicle_id) as { updated_at: string } | undefined;
+
+      if (!curState || curState.updated_at <= recordedAt) {
+        if (eventType === 'FIN_JORNADA' || eventType === 'SALIDA') {
+          db.prepare(
+            `INSERT INTO driver_geofence_state (vehicle_id, current_geofence_id, entered_at, last_lat, last_lng, updated_at)
+             VALUES (?, NULL, NULL, ?, ?, ?)
+             ON CONFLICT(vehicle_id) DO UPDATE SET
+               current_geofence_id = NULL,
+               entered_at = NULL,
+               last_lat = excluded.last_lat,
+               last_lng = excluded.last_lng,
+               updated_at = excluded.updated_at`
+          ).run(user.vehicle_id, coords.lat, coords.lng, recordedAt);
+        } else {
+          db.prepare(
+            `INSERT INTO driver_geofence_state (vehicle_id, current_geofence_id, entered_at, last_lat, last_lng, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(vehicle_id) DO UPDATE SET
+               current_geofence_id = excluded.current_geofence_id,
+               entered_at = excluded.entered_at,
+               last_lat = excluded.last_lat,
+               last_lng = excluded.last_lng,
+               updated_at = excluded.updated_at`
+          ).run(
+            user.vehicle_id,
+            matchedGf ? matchedGf.id : null,
+            matchedGf ? recordedAt : null,
+            coords.lat,
+            coords.lng,
+            recordedAt
+          );
+        }
+      }
+
+      return { ok: true as const, inserted: true };
+    })();
+
+    if (txResult.ok) {
+      syncedEventUuids.push(uuid);
+      if (txResult.inserted) syncedEventsCount += 1;
+    } else {
+      rejectedEvents.push({ event_uuid: uuid, reason: txResult.reason });
+    }
+  }
+
+  // Sync offline GPS route breadcrumbs in chronological order
+  const normalizedPoints = rawPoints
+    .map((pt) => (pt && typeof pt === 'object' ? (pt as Record<string, unknown>) : null))
+    .filter((pt): pt is Record<string, unknown> => pt !== null)
+    .sort((a, b) => {
+      const ta = typeof a.recorded_at === 'string' ? new Date(a.recorded_at).getTime() : 0;
+      const tb = typeof b.recorded_at === 'string' ? new Date(b.recorded_at).getTime() : 0;
+      return (Number.isFinite(ta) ? ta : 0) - (Number.isFinite(tb) ? tb : 0);
+    });
+
+  const pointsTx = db.transaction(() => {
+    for (const pt of normalizedPoints) {
+      const coords = validateCoords(pt.latitude, pt.longitude);
+      const recordedDateObj = validateOfflineRecordedAt(pt.recorded_at);
+      if (!coords || !recordedDateObj) {
+        continue;
+      }
+      const cleanAccuracy =
+        typeof pt.accuracy_meters === 'number' &&
+        Number.isFinite(pt.accuracy_meters) &&
+        pt.accuracy_meters >= 0
+          ? Math.round(pt.accuracy_meters * 10) / 10
+          : null;
+
+      const { eventDate, recordedAt } = getServerDateParts(recordedDateObj);
+
+      // Idempotency: skip exact timestamp already saved
+      const dupPt = db
+        .prepare('SELECT id FROM route_points WHERE vehicle_id = ? AND recorded_at = ? LIMIT 1')
+        .get(user.vehicle_id, recordedAt);
+      if (dupPt) {
+        syncedPointsCount += 1;
+        continue;
+      }
+
+      // Only persist route points while a shift was active at that timestamp
+      const priorEvent = db
+        .prepare(
+          'SELECT event_type FROM events WHERE vehicle_id = ? AND recorded_at <= ? ORDER BY recorded_at DESC, id DESC LIMIT 1'
+        )
+        .get(user.vehicle_id, recordedAt) as { event_type: EventRow['event_type'] } | undefined;
+
+      if (!priorEvent || priorEvent.event_type === 'FIN_JORNADA') {
+        syncedPointsCount += 1;
+        continue;
+      }
+
+      const prevPt = db
+        .prepare(
+          `SELECT latitude, longitude, recorded_at FROM route_points
+           WHERE vehicle_id = ? AND event_date = ? AND recorded_at <= ?
+           ORDER BY recorded_at DESC, id DESC LIMIT 1`
+        )
+        .get(user.vehicle_id, eventDate, recordedAt) as
+        | { latitude: number; longitude: number; recorded_at: string }
+        | undefined;
+
+      let shouldInsert = true;
+      if (prevPt) {
+        const dist = haversineMeters(prevPt.latitude, prevPt.longitude, coords.lat, coords.lng);
+        const elapsedSec =
+          (new Date(recordedAt).getTime() - new Date(prevPt.recorded_at).getTime()) / 1000;
+        if (dist < 25 && elapsedSec < 120) {
+          shouldInsert = false;
+        }
+      }
+
+      if (shouldInsert) {
+        db.prepare(
+          `INSERT INTO route_points (vehicle_id, user_id, event_date, recorded_at, latitude, longitude, accuracy_meters)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        ).run(user.vehicle_id, user.id, eventDate, recordedAt, coords.lat, coords.lng, cleanAccuracy);
+      }
+      syncedPointsCount += 1;
+    }
+  });
+
+  pointsTx();
+
+  res.json({
+    syncedEventUuids,
+    rejectedEvents,
+    syncedEventsCount,
+    syncedPointsCount,
   });
 });
 
