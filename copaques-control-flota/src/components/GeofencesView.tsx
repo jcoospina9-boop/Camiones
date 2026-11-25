@@ -21,18 +21,18 @@ const CATEGORIES: GeofenceCategory[] = [
   'Otro',
 ];
 
-type TileLayerKey = 'osm' | 'streets' | 'satellite';
+type TileLayerKey = 'esri' | 'topo' | 'satellite';
 
 const TILE_LAYERS: Record<TileLayerKey, { label: string; url: string; attribution: string }> = {
-  osm: {
-    label: 'OpenStreetMap',
-    url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-    attribution: '&copy; OpenStreetMap contributors',
+  esri: {
+    label: 'Esri Calles',
+    url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',
+    attribution: 'Tiles &copy; Esri',
   },
-  streets: {
-    label: 'Calles (Carto)',
-    url: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
-    attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+  topo: {
+    label: 'Esri Topográfico',
+    url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}',
+    attribution: 'Tiles &copy; Esri',
   },
   satellite: {
     label: 'Satélite',
@@ -70,7 +70,7 @@ export function GeofencesView({
   );
   const [radiusMeters, setRadiusMeters] = useState<number>(150);
   const [active, setActive] = useState<boolean>(true);
-  const [tileStyle, setTileStyle] = useState<TileLayerKey>('osm');
+  const [tileStyle, setTileStyle] = useState<TileLayerKey>('esri');
 
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<L.Map | null>(null);
@@ -184,8 +184,8 @@ export function GeofencesView({
     });
     layer.on('tileerror', () => {
       tileErrorCountRef.current += 1;
-      if (tileErrorCountRef.current >= 4 && tileStyle === 'osm') {
-        setTileStyle('streets');
+      if (tileErrorCountRef.current >= 4 && tileStyle === 'esri') {
+        setTileStyle('topo');
       }
     });
     layer.addTo(map);

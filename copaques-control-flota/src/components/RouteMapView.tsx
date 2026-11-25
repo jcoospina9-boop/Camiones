@@ -36,23 +36,18 @@ interface RouteMapViewProps {
   onCreateGeofenceFromPoint: (point: { lat: number; lng: number; suggestedName: string }) => void;
 }
 
-type TileLayerKey = 'osm' | 'carto' | 'esri' | 'satellite';
+type TileLayerKey = 'esri' | 'topo' | 'satellite';
 type MapMode = 'gps' | 'draw';
 
 const TILE_LAYERS: Record<TileLayerKey, { label: string; url: string; attribution: string }> = {
-  osm: {
-    label: 'OpenStreetMap',
-    url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-    attribution: '&copy; OpenStreetMap contributors',
-  },
-  carto: {
-    label: 'Mapa Calles (Carto)',
-    url: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
-    attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
-  },
   esri: {
     label: 'Esri Calles',
     url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',
+    attribution: 'Tiles &copy; Esri',
+  },
+  topo: {
+    label: 'Esri Topográfico',
+    url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}',
     attribution: 'Tiles &copy; Esri',
   },
   satellite: {
@@ -132,7 +127,7 @@ export function RouteMapView({
     vehicles.length > 0 ? String(vehicles[0].id) : ''
   );
   const [selectedDate, setSelectedDate] = useState<string>(getColombiaToday());
-  const [tileStyle, setTileStyle] = useState<TileLayerKey>('osm');
+  const [tileStyle, setTileStyle] = useState<TileLayerKey>('esri');
   const [snapToRoads, setSnapToRoads] = useState<boolean>(true);
   const [routeData, setRouteData] = useState<RouteResponse | null>(null);
   const [loading, setLoading] = useState(false);
@@ -283,8 +278,7 @@ export function RouteMapView({
     layer.on('tileerror', () => {
       tileErrorCountRef.current += 1;
       if (tileErrorCountRef.current >= 4) {
-        if (tileStyle === 'osm') setTileStyle('carto');
-        else if (tileStyle === 'carto') setTileStyle('esri');
+        if (tileStyle === 'esri') setTileStyle('topo');
       }
     });
     layer.addTo(map);
