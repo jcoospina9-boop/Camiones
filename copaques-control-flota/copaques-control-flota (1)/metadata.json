@@ -1,0 +1,6 @@
+{
+  "name": "ControlFlota — Trazabilidad y Control de Recorridos",
+  "description": "Sistema integral de trazabilidad GPS, control de jornadas, geocercas y reportes para flotas de transporte de materiales de construcción.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
