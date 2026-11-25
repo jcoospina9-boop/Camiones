@@ -1,10 +1,13 @@
 import L from 'leaflet';
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
-import { Edit2, MapPin, Plus, Power, Trash2 } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { Edit2, LocateFixed, MapPin, Plus, Power, Trash2 } from 'lucide-react';
 import { apiFetch } from '../lib/api.ts';
-import type { Geofence, GeofenceCategory } from '../types.ts';
+import type { Geofence, GeofenceCategory, Sede, UserRole } from '../types.ts';
 
 interface GeofencesViewProps {
+  sedes: Sede[];
+  selectedSedeId: number | null;
+  userRole: UserRole;
   prefillPoint: { lat: number; lng: number; suggestedName: string } | null;
   onClearPrefill: () => void;
 }
@@ -18,7 +21,38 @@ const CATEGORIES: GeofenceCategory[] = [
   'Otro',
 ];
 
-export function GeofencesView({ prefillPoint, onClearPrefill }: GeofencesViewProps) {
+type TileLayerKey = 'osm' | 'streets' | 'satellite';
+
+const TILE_LAYERS: Record<TileLayerKey, { label: string; url: string; attribution: string }> = {
+  osm: {
+    label: 'OpenStreetMap',
+    url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    attribution: '&copy; OpenStreetMap contributors',
+  },
+  streets: {
+    label: 'Calles (Carto)',
+    url: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
+    attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+  },
+  satellite: {
+    label: 'Satélite',
+    url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    attribution: 'Tiles &copy; Esri',
+  },
+};
+
+export function GeofencesView({
+  sedes,
+  selectedSedeId,
+  userRole,
+  prefillPoint,
+  onClearPrefill,
+}: GeofencesViewProps) {
+  const activeSede = useMemo(
+    () => sedes.find((s) => s.id === selectedSedeId) ?? sedes[0] ?? null,
+    [sedes, selectedSedeId]
+  );
+
   const [geofences, setGeofences] = useState<Geofence[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -27,27 +61,47 @@ export function GeofencesView({ prefillPoint, onClearPrefill }: GeofencesViewPro
   const [editingId, setEditingId] = useState<number | null>(null);
   const [name, setName] = useState('');
   const [category, setCategory] = useState<GeofenceCategory>('Obra');
-  const [latitude, setLatitude] = useState<string>('4.71100');
-  const [longitude, setLongitude] = useState<string>('-74.07210');
+  const [gfSedeId, setGfSedeId] = useState<string>(selectedSedeId ? String(selectedSedeId) : '');
+  const [latitude, setLatitude] = useState<string>(
+    activeSede ? activeSede.latitude.toFixed(5) : '6.24420'
+  );
+  const [longitude, setLongitude] = useState<string>(
+    activeSede ? activeSede.longitude.toFixed(5) : '-75.58120'
+  );
   const [radiusMeters, setRadiusMeters] = useState<number>(150);
   const [active, setActive] = useState<boolean>(true);
+  const [tileStyle, setTileStyle] = useState<TileLayerKey>('osm');
 
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<L.Map | null>(null);
+  const tileLayerRef = useRef<L.TileLayer | null>(null);
+  const tileErrorCountRef = useRef(0);
   const layerGroupRef = useRef<L.LayerGroup | null>(null);
   const previewLayerRef = useRef<L.LayerGroup | null>(null);
+
+  useEffect(() => {
+    if (!editingId) {
+      setGfSedeId(selectedSedeId ? String(selectedSedeId) : '');
+      if (activeSede) {
+        setLatitude(activeSede.latitude.toFixed(5));
+        setLongitude(activeSede.longitude.toFixed(5));
+        mapRef.current?.flyTo([activeSede.latitude, activeSede.longitude], 13, { duration: 0.4 });
+      }
+    }
+  }, [selectedSedeId, activeSede, editingId]);
 
   const loadGeofences = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await apiFetch<{ geofences: Geofence[] }>('/api/admin/geofences');
+      const qs = selectedSedeId ? `?sedeId=${selectedSedeId}` : '';
+      const res = await apiFetch<{ geofences: Geofence[] }>(`/api/admin/geofences${qs}`);
       setGeofences(res.geofences);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error al cargar geocercas.');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [selectedSedeId]);
 
   useEffect(() => {
     loadGeofences();
@@ -74,15 +128,13 @@ export function GeofencesView({ prefillPoint, onClearPrefill }: GeofencesViewPro
     const el = mapContainerRef.current;
     if (!el || mapRef.current) return;
 
+    const initialLat = activeSede ? activeSede.latitude : 6.2442;
+    const initialLng = activeSede ? activeSede.longitude : -75.5812;
+
     const map = L.map(el, {
-      center: [4.711, -74.0721],
+      center: [initialLat, initialLng],
       zoom: 12,
     });
-
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
-      attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
-      maxZoom: 19,
-    }).addTo(map);
 
     const existingGroup = L.layerGroup().addTo(map);
     const previewGroup = L.layerGroup().addTo(map);
@@ -100,16 +152,45 @@ export function GeofencesView({ prefillPoint, onClearPrefill }: GeofencesViewPro
       map.invalidateSize();
     });
     observer.observe(el);
-    setTimeout(() => map.invalidateSize(), 100);
+    const raf = requestAnimationFrame(() => map.invalidateSize());
+    const t1 = setTimeout(() => map.invalidateSize(), 120);
+    const t2 = setTimeout(() => map.invalidateSize(), 350);
 
     return () => {
+      cancelAnimationFrame(raf);
+      clearTimeout(t1);
+      clearTimeout(t2);
       observer.disconnect();
       map.remove();
       mapRef.current = null;
+      tileLayerRef.current = null;
       layerGroupRef.current = null;
       previewLayerRef.current = null;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (tileLayerRef.current) {
+      tileLayerRef.current.remove();
+    }
+    tileErrorCountRef.current = 0;
+    const cfg = TILE_LAYERS[tileStyle];
+    const layer = L.tileLayer(cfg.url, {
+      attribution: cfg.attribution,
+      maxZoom: 19,
+    });
+    layer.on('tileerror', () => {
+      tileErrorCountRef.current += 1;
+      if (tileErrorCountRef.current >= 4 && tileStyle === 'osm') {
+        setTileStyle('streets');
+      }
+    });
+    layer.addTo(map);
+    tileLayerRef.current = layer;
+  }, [tileStyle]);
 
   // Draw saved geofences
   useEffect(() => {
@@ -144,6 +225,7 @@ export function GeofencesView({ prefillPoint, onClearPrefill }: GeofencesViewPro
     }
 
     if (coords.length > 0 && !editingId) {
+      map.invalidateSize();
       map.fitBounds(L.latLngBounds(coords), { padding: [40, 40], maxZoom: 14 });
     }
   }, [geofences, editingId]);
@@ -180,6 +262,7 @@ export function GeofencesView({ prefillPoint, onClearPrefill }: GeofencesViewPro
     setEditingId(null);
     setName('');
     setCategory('Obra');
+    setGfSedeId(selectedSedeId ? String(selectedSedeId) : '');
     setRadiusMeters(150);
     setActive(true);
   }
@@ -188,6 +271,7 @@ export function GeofencesView({ prefillPoint, onClearPrefill }: GeofencesViewPro
     setEditingId(gf.id);
     setName(gf.name);
     setCategory(gf.category);
+    setGfSedeId(gf.sede_id ? String(gf.sede_id) : '');
     setLatitude(gf.latitude.toFixed(6));
     setLongitude(gf.longitude.toFixed(6));
     setRadiusMeters(gf.radius_meters);
@@ -203,6 +287,7 @@ export function GeofencesView({ prefillPoint, onClearPrefill }: GeofencesViewPro
       const payload = {
         name,
         category,
+        sede_id: userRole === 'GERENCIA' ? (gfSedeId ? Number(gfSedeId) : null) : undefined,
         latitude: Number(latitude),
         longitude: Number(longitude),
         radius_meters: Number(radiusMeters),
@@ -262,12 +347,46 @@ export function GeofencesView({ prefillPoint, onClearPrefill }: GeofencesViewPro
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
         {/* Map Picker */}
         <div className="lg:col-span-7 bg-white border border-slate-200 rounded-xl overflow-hidden">
-          <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+          <div className="px-4 py-3 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-sm font-bold text-slate-900">
               <MapPin className="w-4 h-4 text-amber-600" />
-              <span>Haz clic en el mapa para definir el centro de la geocerca</span>
+              <span>Haz clic en el mapa para definir el centro</span>
             </div>
-            <span className="text-xs text-slate-500">Radio naranja = vista previa</span>
+            <div className="flex items-center gap-2">
+              <select
+                value={tileStyle}
+                onChange={(e) => setTileStyle(e.target.value as TileLayerKey)}
+                aria-label="Vista del mapa"
+                className="h-8 px-2 rounded-md border border-slate-200 text-xs text-slate-700 bg-white"
+              >
+                {(Object.keys(TILE_LAYERS) as TileLayerKey[]).map((key) => (
+                  <option key={key} value={key}>
+                    {TILE_LAYERS[key].label}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!('geolocation' in navigator) || !mapRef.current) return;
+                  navigator.geolocation.getCurrentPosition(
+                    (pos) => {
+                      setLatitude(pos.coords.latitude.toFixed(6));
+                      setLongitude(pos.coords.longitude.toFixed(6));
+                      mapRef.current?.flyTo([pos.coords.latitude, pos.coords.longitude], 15, {
+                        duration: 0.5,
+                      });
+                    },
+                    () => setError('No se pudo obtener tu ubicación actual.')
+                  );
+                }}
+                className="h-8 px-2.5 rounded-md border border-slate-200 bg-white hover:bg-emerald-50 text-xs font-medium text-emerald-900 flex items-center gap-1 cursor-pointer"
+              >
+                <LocateFixed className="w-3.5 h-3.5" />
+                <span>Mi ubicación</span>
+              </button>
+              <span className="text-xs text-slate-500">Radio amarillo = vista previa</span>
+            </div>
           </div>
           <div ref={mapContainerRef} className="w-full h-[460px]" />
         </div>
@@ -302,19 +421,39 @@ export function GeofencesView({ prefillPoint, onClearPrefill }: GeofencesViewPro
               />
             </div>
 
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">Categoría</label>
-              <select
-                value={category}
-                onChange={(e) => setCategory(e.target.value as GeofenceCategory)}
-                className="w-full h-10 px-3 rounded-lg border border-slate-300 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-emerald-700"
-              >
-                {CATEGORIES.map((c) => (
-                  <option key={c} value={c}>
-                    {c}
-                  </option>
-                ))}
-              </select>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">Categoría</label>
+                <select
+                  value={category}
+                  onChange={(e) => setCategory(e.target.value as GeofenceCategory)}
+                  className="w-full h-10 px-3 rounded-lg border border-slate-300 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-emerald-700"
+                >
+                  {CATEGORIES.map((c) => (
+                    <option key={c} value={c}>
+                      {c}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {userRole === 'GERENCIA' && (
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Sede</label>
+                  <select
+                    value={gfSedeId}
+                    onChange={(e) => setGfSedeId(e.target.value)}
+                    className="w-full h-10 px-3 rounded-lg border border-slate-300 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-emerald-700"
+                  >
+                    <option value="">Todas las sedes (Global)</option>
+                    {sedes.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
             </div>
 
             <div className="grid grid-cols-2 gap-3">
@@ -411,7 +550,7 @@ export function GeofencesView({ prefillPoint, onClearPrefill }: GeofencesViewPro
           <div className="p-6 text-center text-sm text-slate-500">Cargando geocercas...</div>
         ) : geofences.length === 0 ? (
           <div className="p-8 text-center text-sm text-slate-500">
-            No hay geocercas configuradas. Haz clic en el mapa superior para crear la primera (ej. Planta Principal).
+            No hay geocercas configuradas en esta sede. Haz clic en el mapa superior para crear la primera.
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -419,6 +558,7 @@ export function GeofencesView({ prefillPoint, onClearPrefill }: GeofencesViewPro
               <thead>
                 <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
                   <th className="py-2.5 px-4">Nombre</th>
+                  <th className="py-2.5 px-4">Sede</th>
                   <th className="py-2.5 px-4">Categoría</th>
                   <th className="py-2.5 px-4">Coordenadas</th>
                   <th className="py-2.5 px-4 text-right">Radio</th>
@@ -430,6 +570,9 @@ export function GeofencesView({ prefillPoint, onClearPrefill }: GeofencesViewPro
                 {geofences.map((gf) => (
                   <tr key={gf.id} className="hover:bg-slate-50">
                     <td className="py-2.5 px-4 font-semibold text-slate-900">{gf.name}</td>
+                    <td className="py-2.5 px-4 text-xs font-medium text-slate-600">
+                      {gf.sede_name || 'Todas'}
+                    </td>
                     <td className="py-2.5 px-4 text-slate-600">{gf.category}</td>
                     <td className="py-2.5 px-4 font-mono tabular-nums text-xs text-slate-500">
                       {gf.latitude.toFixed(5)}, {gf.longitude.toFixed(5)}

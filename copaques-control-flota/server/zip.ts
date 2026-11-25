@@ -97,7 +97,7 @@ const ALLOWED_ROOT_FILES = [
   'README.md',
 ];
 
-const ALLOWED_ROOT_DIRS = ['src', 'server', 'docs', 'scripts'];
+const ALLOWED_ROOT_DIRS = ['src', 'server', 'public', 'docs', 'scripts'];
 
 function collectDirFiles(
   baseDir: string,

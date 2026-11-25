@@ -8,17 +8,21 @@ const JWT_SECRET =
     ? process.env.JWT_SECRET.trim()
     : crypto.randomBytes(32).toString('hex');
 
+export type UserRole = 'CONDUCTOR' | 'ADMIN' | 'GERENCIA';
+
 export interface AuthTokenPayload {
   userId: number;
   username: string;
-  role: 'CONDUCTOR' | 'GERENCIA';
+  role: UserRole;
 }
 
 export interface AuthenticatedUser {
   id: number;
   username: string;
   full_name: string;
-  role: 'CONDUCTOR' | 'GERENCIA';
+  role: UserRole;
+  sede_id: number | null;
+  sede_name: string | null;
   vehicle_id: number | null;
   vehicle_code: string | null;
   vehicle_plate: string | null;
@@ -40,9 +44,11 @@ export function verifyAuthToken(token: string): AuthTokenPayload {
 export function getUserById(userId: number): AuthenticatedUser | null {
   const row = db
     .prepare(
-      `SELECT u.id, u.username, u.full_name, u.role, u.vehicle_id, u.active,
+      `SELECT u.id, u.username, u.full_name, u.role, u.sede_id, u.vehicle_id, u.active,
+              s.name AS sede_name,
               v.code AS vehicle_code, v.plate AS vehicle_plate
        FROM users u
+       LEFT JOIN sedes s ON s.id = u.sede_id
        LEFT JOIN vehicles v ON v.id = u.vehicle_id
        WHERE u.id = ?`
     )
@@ -77,13 +83,13 @@ export function requireAuth(req: AuthedRequest, res: Response, next: NextFunctio
   }
 }
 
-export function requireRole(role: 'CONDUCTOR' | 'GERENCIA') {
+export function requireRole(...roles: UserRole[]) {
   return (req: AuthedRequest, res: Response, next: NextFunction): void => {
     if (!req.user) {
       res.status(401).json({ error: 'Autenticación requerida.' });
       return;
     }
-    if (req.user.role !== role) {
+    if (!roles.includes(req.user.role)) {
       res.status(403).json({ error: 'No tienes permisos para acceder a este módulo.' });
       return;
     }

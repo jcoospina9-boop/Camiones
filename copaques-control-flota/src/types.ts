@@ -1,4 +1,4 @@
-export type UserRole = 'CONDUCTOR' | 'GERENCIA';
+export type UserRole = 'CONDUCTOR' | 'ADMIN' | 'GERENCIA';
 
 export type EventType = 'INICIO_JORNADA' | 'FIN_JORNADA' | 'ENTRADA' | 'SALIDA';
 
@@ -12,11 +12,32 @@ export type GeofenceCategory =
   | 'Proveedor'
   | 'Otro';
 
+export interface Sede {
+  id: number;
+  name: string;
+  code: string;
+  latitude: number;
+  longitude: number;
+  active: number;
+}
+
+export interface SedeSummary {
+  id: number;
+  name: string;
+  code: string;
+  vehiclesCount: number;
+  activeShiftsCount: number;
+  eventsTodayCount: number;
+  adminsCount: number;
+}
+
 export interface User {
   id: number;
   username: string;
   full_name: string;
   role: UserRole;
+  sede_id: number | null;
+  sede_name?: string | null;
   vehicle_id: number | null;
   vehicle_code: string | null;
   vehicle_plate: string | null;
@@ -31,6 +52,8 @@ export interface Vehicle {
   brand: string;
   model: string;
   capacity_tons: number;
+  sede_id: number | null;
+  sede_name?: string;
   active: number;
   created_at: string;
   assigned_user_id?: number | null;
@@ -54,12 +77,45 @@ export interface FleetEvent {
   vehicle_id: number | null;
   vehicle_code_snapshot: string;
   vehicle_plate_snapshot: string;
+  sede_id?: number | null;
+  sede_name_snapshot?: string;
   event_type: EventType;
   source: EventSource;
   geofence_id: number | null;
   geofence_name_snapshot: string | null;
   notes: string;
   created_at: string;
+}
+
+export interface RoutePoint {
+  id: number;
+  vehicle_id: number;
+  user_id: number;
+  event_date: string;
+  recorded_at: string;
+  latitude: number;
+  longitude: number;
+  accuracy_meters: number | null;
+}
+
+export interface PlannedWaypoint {
+  lat: number;
+  lng: number;
+  label?: string;
+}
+
+export interface PlannedRoute {
+  id: number;
+  name: string;
+  sede_id: number | null;
+  sede_name?: string | null;
+  vehicle_id: number | null;
+  vehicle_code?: string | null;
+  vehicle_plate?: string | null;
+  waypoints_json: string;
+  distance_km: number;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface Geofence {
@@ -69,6 +125,8 @@ export interface Geofence {
   latitude: number;
   longitude: number;
   radius_meters: number;
+  sede_id?: number | null;
+  sede_name?: string;
   active: number;
   created_by: number | null;
   created_at: string;
@@ -96,6 +154,8 @@ export interface FleetVehicleStatus {
   brand: string;
   model: string;
   capacity_tons: number;
+  sede_id: number | null;
+  sede_name?: string;
   active: number;
   driver_id: number | null;
   driver_name: string | null;
@@ -108,6 +168,7 @@ export interface FleetVehicleStatus {
 
 export interface DashboardResponse {
   today: string;
+  scopedSedeId: number | null;
   kpis: {
     totalVehicles: number;
     activeVehiclesCount: number;
@@ -117,17 +178,21 @@ export interface DashboardResponse {
     entriesTodayCount: number;
     activeGeofencesCount: number;
   };
+  sedeSummaries: SedeSummary[];
   recentEvents: FleetEvent[];
   fleetStatus: FleetVehicleStatus[];
 }
 
 export interface RouteResponse {
-  vehicle: Vehicle;
+  vehicle: Vehicle & { sede_lat?: number | null; sede_lng?: number | null };
   date: string;
   events: FleetEvent[];
+  routePoints: RoutePoint[];
   geofences: Geofence[];
+  availableDates: string[];
   summary: {
     totalEvents: number;
+    gpsPointsCount: number;
     entriesCount: number;
     exitsCount: number;
     distanceKm: number;
@@ -197,9 +262,34 @@ export function formatEventLabel(type: EventType): string {
   }
 }
 
+export function formatRoleLabel(role: UserRole): string {
+  switch (role) {
+    case 'GERENCIA':
+      return 'Gerente';
+    case 'ADMIN':
+      return 'Administrador';
+    case 'CONDUCTOR':
+      return 'Conductor';
+  }
+}
+
 export function formatMinutesAsHours(mins: number | null | undefined): string {
   if (mins === null || mins === undefined) return 'En curso';
   const h = Math.floor(mins / 60);
   const m = mins % 60;
   return `${h}h ${String(m).padStart(2, '0')}m`;
+}
+
+export function getColombiaToday(): string {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Bogota',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+  const map: Record<string, string> = {};
+  for (const p of parts) {
+    if (p.type !== 'literal') map[p.type] = p.value;
+  }
+  return `${map.year}-${map.month}-${map.day}`;
 }

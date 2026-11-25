@@ -5,6 +5,7 @@ import { exportReportToExcel, exportReportToPDF } from '../lib/exportReports.ts'
 import {
   formatEventLabel,
   formatMinutesAsHours,
+  getColombiaToday,
   type ReportResponse,
   type User,
   type Vehicle,
@@ -13,6 +14,7 @@ import {
 interface ReportsViewProps {
   vehicles: Vehicle[];
   users: User[];
+  selectedSedeId: number | null;
 }
 
 function toYmd(d: Date): string {
@@ -22,8 +24,8 @@ function toYmd(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
-export function ReportsView({ vehicles, users }: ReportsViewProps) {
-  const today = toYmd(new Date());
+export function ReportsView({ vehicles, users, selectedSedeId }: ReportsViewProps) {
+  const today = getColombiaToday();
   const [period, setPeriod] = useState<'daily' | 'weekly' | 'monthly' | 'custom'>('daily');
   const [startDate, setStartDate] = useState(today);
   const [endDate, setEndDate] = useState(today);
@@ -39,14 +41,14 @@ export function ReportsView({ vehicles, users }: ReportsViewProps) {
 
   function applyPreset(preset: 'daily' | 'weekly' | 'monthly') {
     const now = new Date();
-    const end = toYmd(now);
+    const end = getColombiaToday();
     let start = end;
     if (preset === 'weekly') {
       const d = new Date(now);
       d.setDate(d.getDate() - 6);
       start = toYmd(d);
     } else if (preset === 'monthly') {
-      start = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+      start = `${end.slice(0, 7)}-01`;
     }
     setPeriod(preset);
     setStartDate(start);
@@ -58,6 +60,7 @@ export function ReportsView({ vehicles, users }: ReportsViewProps) {
     setError(null);
     try {
       const params = new URLSearchParams({ startDate, endDate });
+      if (selectedSedeId) params.set('sedeId', String(selectedSedeId));
       if (vehicleId) params.set('vehicleId', vehicleId);
       if (userId) params.set('userId', userId);
       const data = await apiFetch<ReportResponse>(`/api/admin/reports?${params.toString()}`);
@@ -67,7 +70,7 @@ export function ReportsView({ vehicles, users }: ReportsViewProps) {
     } finally {
       setLoading(false);
     }
-  }, [startDate, endDate, vehicleId, userId]);
+  }, [startDate, endDate, selectedSedeId, vehicleId, userId]);
 
   useEffect(() => {
     loadReport();

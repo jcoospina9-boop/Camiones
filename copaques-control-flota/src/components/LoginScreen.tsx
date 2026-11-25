@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { Eye, EyeOff, Lock, ShieldCheck, Truck, User as UserIcon } from 'lucide-react';
+import { Eye, EyeOff, Lock, User as UserIcon } from 'lucide-react';
 import { apiFetch, setAuthToken } from '../lib/api.ts';
 import type { User } from '../types.ts';
 
@@ -10,11 +10,14 @@ interface LoginScreenProps {
 export function LoginScreen({ onAuthenticated }: LoginScreenProps) {
   const [checkingStatus, setCheckingStatus] = useState(true);
   const [needsInitialSetup, setNeedsInitialSetup] = useState(false);
+  const [envAdminConfigured, setEnvAdminConfigured] = useState(false);
+  const [forceLoginMode, setForceLoginMode] = useState(false);
 
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [fullName, setFullName] = useState('');
   const [showPassword, setShowPassword] = useState(false);
+  const [logoError, setLogoError] = useState(false);
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -25,10 +28,11 @@ export function LoginScreen({ onAuthenticated }: LoginScreenProps) {
       .then((res) => {
         if (!active) return;
         setNeedsInitialSetup(res.needsInitialSetup);
+        setEnvAdminConfigured(res.envAdminConfigured);
       })
       .catch(() => {
         if (!active) return;
-        setError('No se pudo conectar con el servidor. Verifica que el servicio esté activo.');
+        setError('No se pudo conectar con el servidor.');
       })
       .finally(() => {
         if (active) setCheckingStatus(false);
@@ -79,206 +83,221 @@ export function LoginScreen({ onAuthenticated }: LoginScreenProps) {
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col justify-center px-4 py-8 sm:px-6 lg:px-8">
-      <div className="max-w-5xl w-full mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch">
-        {/* Left Informational Panel */}
-        <div className="lg:col-span-6 bg-emerald-950 text-white rounded-2xl p-8 sm:p-10 flex flex-col justify-between border border-emerald-900">
-          <div>
-            <div className="flex items-center gap-3">
-              <div className="w-11 h-11 rounded-xl bg-yellow-400 text-emerald-950 flex items-center justify-center shrink-0">
-                <Truck className="w-6 h-6" />
-              </div>
-              <div>
-                <h1 className="text-2xl font-bold tracking-tight text-white">Copaques</h1>
-                <p className="text-xs text-emerald-200">
-                  Control de Flota y Recorridos
+    <div className="min-h-screen bg-[#f6f9f6] flex flex-col justify-between">
+      {/* Top Copaques Geometric Ribbon */}
+      <div className="h-2 w-full flex shrink-0" aria-hidden="true">
+        <div className="flex-1 bg-[#0e7a2d]" />
+        <div className="w-1/4 bg-[#65a30d]" />
+        <div className="w-1/5 bg-[#eab308]" />
+      </div>
+
+      <main className="flex-1 flex items-center justify-center px-4 py-10">
+        <div className="w-full max-w-[420px] bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-xs">
+          {/* Clean White Logo Header */}
+          <div className="px-8 pt-8 pb-6 bg-white border-b border-slate-100 flex flex-col items-center text-center">
+            {!logoError ? (
+              <img
+                src="/assets/aistudio/image_2fcce064.png"
+                alt="Copaques - Materiales para construcción"
+                referrerPolicy="no-referrer"
+                onError={() => setLogoError(true)}
+                className="w-full max-w-[280px] h-auto object-contain rounded-lg"
+              />
+            ) : (
+              <div className="py-2">
+                <span className="text-3xl font-bold tracking-tight text-[#181a18]">copaques</span>
+                <p className="text-xs tracking-[0.2em] text-slate-600 mt-1">
+                  materiales para construcción
                 </p>
               </div>
-            </div>
-
-            <h2 className="mt-8 text-3xl font-semibold tracking-tight text-balance text-white leading-tight">
-              Trazabilidad GPS y control operativo de la flota Copaques
-            </h2>
-
-            <p className="mt-4 text-sm text-emerald-100/85 leading-relaxed">
-              Registro automático de fecha, hora y ubicación GPS para los camiones distribuidores de
-              materiales de construcción de Copaques.
-            </p>
+            )}
           </div>
 
-          <div className="mt-10 pt-6 border-t border-emerald-900 grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
-            <div>
-              <p className="font-semibold text-yellow-300">Aplicación Conductor</p>
-              <p className="mt-1 text-xs text-emerald-100/75">
-                Botones amplios para inicio de jornada, entradas, salidas y fin de jornada con captura GPS automática.
-              </p>
-            </div>
-            <div>
-              <p className="font-semibold text-yellow-300">Panel de Gerencia</p>
-              <p className="mt-1 text-xs text-emerald-100/75">
-                Mapas de recorridos diarios, geocercas automáticas, reportes PDF/Excel y respaldos locales.
-              </p>
-            </div>
-          </div>
-        </div>
-
-        {/* Right Auth / Setup Card */}
-        <div className="lg:col-span-6 bg-white border border-slate-200 rounded-2xl p-8 sm:p-10 flex flex-col justify-center">
-          {checkingStatus ? (
-            <div className="py-12 text-center text-sm text-slate-500">
-              Verificando estado del sistema...
-            </div>
-          ) : needsInitialSetup ? (
-            <div>
-              <div className="flex items-center gap-2 text-emerald-700 text-xs font-semibold mb-2">
-                <ShieldCheck className="w-4 h-4" />
-                <span>Primer inicio del sistema</span>
+          {/* Minimal Form Area */}
+          <div className="p-7 sm:p-8">
+            {checkingStatus ? (
+              <div className="py-10 text-center text-sm text-slate-500">
+                Conectando...
               </div>
-              <h2 className="text-2xl font-bold text-slate-900">
-                Configurar Cuenta de Gerencia
-              </h2>
-              <p className="mt-2 text-sm text-slate-600">
-                Crea la primera cuenta administrativa para gestionar camiones, conductores, geocercas y reportes.
-              </p>
+            ) : needsInitialSetup && !forceLoginMode ? (
+              <div>
+                <h1 className="text-xl font-bold text-[#181a18]">Configuración Inicial</h1>
+                <p className="mt-1 text-sm text-slate-600">
+                  Crea la cuenta principal de Gerencia.
+                </p>
 
-              {error && (
-                <div className="mt-4 p-3 rounded-lg bg-red-50 border border-red-200 text-sm text-red-700">
-                  {error}
-                </div>
-              )}
-
-              <form onSubmit={handleInitialSetup} className="mt-6 space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-1.5">
-                    Nombre completo del administrador
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={fullName}
-                    onChange={(e) => setFullName(e.target.value)}
-                    placeholder="Ej. Gerencia Copaques"
-                    className="w-full h-11 px-3.5 rounded-lg border border-slate-300 text-slate-900 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-700"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-1.5">
-                    Usuario de acceso
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={username}
-                    onChange={(e) => setUsername(e.target.value)}
-                    placeholder="gerencia"
-                    className="w-full h-11 px-3.5 rounded-lg border border-slate-300 text-slate-900 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-700"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-1.5">
-                    Contraseña (mínimo 6 caracteres)
-                  </label>
-                  <div className="relative">
-                    <input
-                      type={showPassword ? 'text' : 'password'}
-                      required
-                      minLength={6}
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                      placeholder="••••••••"
-                      className="w-full h-11 px-3.5 pr-11 rounded-lg border border-slate-300 text-slate-900 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-700"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowPassword(!showPassword)}
-                      className="absolute right-0 top-0 h-11 w-11 flex items-center justify-center text-slate-500 hover:text-emerald-800"
-                      aria-label="Mostrar u ocultar contraseña"
-                    >
-                      {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                    </button>
+                {error && (
+                  <div className="mt-4 p-3 rounded-lg bg-red-50 border border-red-200 text-sm text-red-700">
+                    {error}
                   </div>
-                </div>
+                )}
 
-                <button
-                  type="submit"
-                  disabled={submitting}
-                  className="w-full h-12 rounded-xl bg-emerald-800 text-white font-semibold text-sm hover:bg-emerald-900 disabled:opacity-60 transition-colors cursor-pointer"
-                >
-                  {submitting ? 'Creando cuenta...' : 'Crear Cuenta de Gerencia e Ingresar'}
-                </button>
-              </form>
-            </div>
-          ) : (
-            <div>
-              <h2 className="text-2xl font-bold text-slate-900">Iniciar Sesión</h2>
-              <p className="mt-1.5 text-sm text-slate-600">
-                Ingresa con tu usuario asignado de conductor o gerencia.
-              </p>
-
-              {error && (
-                <div className="mt-4 p-3 rounded-lg bg-red-50 border border-red-200 text-sm text-red-700">
-                  {error}
-                </div>
-              )}
-
-              <form onSubmit={handleLogin} className="mt-6 space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-1.5">
-                    Usuario
-                  </label>
-                  <div className="relative">
-                    <UserIcon className="w-4 h-4 text-slate-400 absolute left-3.5 top-3.5" />
+                <form onSubmit={handleInitialSetup} className="mt-5 space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                      Nombre completo
+                    </label>
                     <input
                       type="text"
                       required
-                      autoComplete="username"
+                      value={fullName}
+                      onChange={(e) => setFullName(e.target.value)}
+                      placeholder="Ej. Gerencia Copaques"
+                      className="w-full h-11 px-3.5 rounded-lg border border-slate-300 text-slate-900 text-sm focus:outline-none focus:ring-2 focus:ring-[#15803d]"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                      Usuario
+                    </label>
+                    <input
+                      type="text"
+                      required
                       value={username}
                       onChange={(e) => setUsername(e.target.value)}
-                      placeholder="camion01 o gerencia"
-                      className="w-full h-12 pl-10 pr-3.5 rounded-lg border border-slate-300 text-slate-900 text-base focus:outline-none focus:ring-2 focus:ring-emerald-700"
+                      placeholder="gerencia"
+                      className="w-full h-11 px-3.5 rounded-lg border border-slate-300 text-slate-900 text-sm focus:outline-none focus:ring-2 focus:ring-[#15803d]"
                     />
                   </div>
-                </div>
 
-                <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-1.5">
-                    Contraseña
-                  </label>
-                  <div className="relative">
-                    <Lock className="w-4 h-4 text-slate-400 absolute left-3.5 top-3.5" />
-                    <input
-                      type={showPassword ? 'text' : 'password'}
-                      required
-                      autoComplete="current-password"
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                      placeholder="••••••••"
-                      className="w-full h-12 pl-10 pr-12 rounded-lg border border-slate-300 text-slate-900 text-base focus:outline-none focus:ring-2 focus:ring-emerald-700"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowPassword(!showPassword)}
-                      className="absolute right-0 top-0 h-12 w-12 flex items-center justify-center text-slate-500 hover:text-emerald-800"
-                      aria-label="Mostrar u ocultar contraseña"
-                    >
-                      {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
-                    </button>
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                      Contraseña (mínimo 6 caracteres)
+                    </label>
+                    <div className="relative">
+                      <input
+                        type={showPassword ? 'text' : 'password'}
+                        required
+                        minLength={6}
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        placeholder="••••••••"
+                        className="w-full h-11 px-3.5 pr-11 rounded-lg border border-slate-300 text-slate-900 text-sm focus:outline-none focus:ring-2 focus:ring-[#15803d]"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowPassword(!showPassword)}
+                        className="absolute right-0 top-0 h-11 w-11 flex items-center justify-center text-slate-500 hover:text-[#0e7a2d]"
+                        aria-label="Mostrar u ocultar contraseña"
+                      >
+                        {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      </button>
+                    </div>
                   </div>
-                </div>
 
-                <button
-                  type="submit"
-                  disabled={submitting}
-                  className="w-full h-12 rounded-xl bg-emerald-800 text-white font-semibold text-base hover:bg-emerald-900 disabled:opacity-60 transition-colors cursor-pointer"
-                >
-                  {submitting ? 'Verificando...' : 'Ingresar'}
-                </button>
-              </form>
-            </div>
-          )}
+                  <button
+                    type="submit"
+                    disabled={submitting}
+                    className="w-full h-12 rounded-xl bg-[#0e7a2d] hover:bg-[#0b6123] text-white font-semibold text-sm disabled:opacity-60 transition-colors cursor-pointer border-b-2 border-[#eab308]"
+                  >
+                    {submitting ? 'Creando cuenta...' : 'Crear cuenta e ingresar'}
+                  </button>
+                </form>
+
+                {envAdminConfigured && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setError(null);
+                      setForceLoginMode(true);
+                    }}
+                    className="mt-4 w-full text-center text-xs font-medium text-slate-500 hover:text-[#0e7a2d] cursor-pointer"
+                  >
+                    ¿Ya tienes clave de servidor? Iniciar sesión
+                  </button>
+                )}
+              </div>
+            ) : (
+              <div>
+                <h1 className="text-xl font-bold text-[#181a18]">Control de Flota</h1>
+                <p className="mt-1 text-sm text-slate-600">
+                  Ingresa con tu usuario y contraseña.
+                </p>
+
+                {error && (
+                  <div className="mt-4 p-3 rounded-lg bg-red-50 border border-red-200 text-sm text-red-700">
+                    {error}
+                  </div>
+                )}
+
+                <form onSubmit={handleLogin} className="mt-5 space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                      Usuario
+                    </label>
+                    <div className="relative">
+                      <UserIcon className="w-4 h-4 text-slate-400 absolute left-3.5 top-3.5" />
+                      <input
+                        type="text"
+                        required
+                        autoComplete="username"
+                        value={username}
+                        onChange={(e) => setUsername(e.target.value)}
+                        placeholder="Tu usuario"
+                        className="w-full h-12 pl-10 pr-3.5 rounded-lg border border-slate-300 text-slate-900 text-base focus:outline-none focus:ring-2 focus:ring-[#15803d]"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-1.5">
+                      Contraseña
+                    </label>
+                    <div className="relative">
+                      <Lock className="w-4 h-4 text-slate-400 absolute left-3.5 top-3.5" />
+                      <input
+                        type={showPassword ? 'text' : 'password'}
+                        required
+                        autoComplete="current-password"
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        placeholder="••••••••"
+                        className="w-full h-12 pl-10 pr-12 rounded-lg border border-slate-300 text-slate-900 text-base focus:outline-none focus:ring-2 focus:ring-[#15803d]"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowPassword(!showPassword)}
+                        className="absolute right-0 top-0 h-12 w-12 flex items-center justify-center text-slate-500 hover:text-[#0e7a2d]"
+                        aria-label="Mostrar u ocultar contraseña"
+                      >
+                        {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                      </button>
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={submitting}
+                    className="w-full h-12 rounded-xl bg-[#0e7a2d] hover:bg-[#0b6123] text-white font-semibold text-base disabled:opacity-60 transition-colors cursor-pointer border-b-2 border-[#eab308]"
+                  >
+                    {submitting ? 'Ingresando...' : 'Ingresar'}
+                  </button>
+                </form>
+
+                {needsInitialSetup && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setError(null);
+                      setForceLoginMode(false);
+                    }}
+                    className="mt-4 w-full text-center text-xs font-medium text-slate-500 hover:text-[#0e7a2d] cursor-pointer"
+                  >
+                    Crear cuenta inicial de Gerencia
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
         </div>
+      </main>
+
+      {/* Bottom Copaques Geometric Ribbon */}
+      <div className="h-2 w-full flex shrink-0" aria-hidden="true">
+        <div className="w-1/4 bg-[#eab308]" />
+        <div className="w-1/4 bg-[#84cc16]" />
+        <div className="flex-1 bg-[#0e7a2d]" />
       </div>
     </div>
   );

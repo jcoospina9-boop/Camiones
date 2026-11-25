@@ -6,11 +6,13 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import {
+  type AuthenticatedUser,
   type AuthedRequest,
   getUserById,
   requireAuth,
   requireRole,
   signAuthToken,
+  type UserRole,
 } from './server/auth.ts';
 import {
   db,
@@ -41,6 +43,27 @@ app.use((_req, res, next) => {
 const VALID_EVENT_TYPES = ['INICIO_JORNADA', 'FIN_JORNADA', 'ENTRADA', 'SALIDA'] as const;
 const VALID_CATEGORIES = ['Planta', 'Cliente', 'Obra', 'Bodega', 'Proveedor', 'Otro'] as const;
 
+interface SedeRow {
+  id: number;
+  name: string;
+  code: string;
+  latitude: number;
+  longitude: number;
+  active: number;
+}
+
+interface VehicleRow {
+  id: number;
+  code: string;
+  plate: string;
+  brand: string;
+  model: string;
+  capacity_tons: number;
+  sede_id: number | null;
+  active: number;
+  created_at: string;
+}
+
 interface GeofenceRow {
   id: number;
   name: string;
@@ -48,6 +71,7 @@ interface GeofenceRow {
   latitude: number;
   longitude: number;
   radius_meters: number;
+  sede_id: number | null;
   active: number;
 }
 
@@ -67,12 +91,25 @@ interface EventRow {
   vehicle_id: number | null;
   vehicle_code_snapshot: string;
   vehicle_plate_snapshot: string;
+  sede_id: number | null;
+  sede_name_snapshot: string;
   event_type: 'INICIO_JORNADA' | 'FIN_JORNADA' | 'ENTRADA' | 'SALIDA';
   source: 'MANUAL' | 'GEOCERCA_AUTO';
   geofence_id: number | null;
   geofence_name_snapshot: string | null;
   notes: string;
   created_at: string;
+}
+
+interface RoutePointRow {
+  id: number;
+  vehicle_id: number;
+  user_id: number;
+  event_date: string;
+  recorded_at: string;
+  latitude: number;
+  longitude: number;
+  accuracy_meters: number | null;
 }
 
 function logAudit(actorUserId: number | null, action: string, details: string): void {
@@ -97,10 +134,83 @@ function validateCoords(lat: unknown, lng: unknown): { lat: number; lng: number 
   return { lat: nLat, lng: nLng };
 }
 
-function findMatchingGeofence(lat: number, lng: number): GeofenceRow | null {
-  const activeGeofences = db
-    .prepare('SELECT id, name, category, latitude, longitude, radius_meters, active FROM geofences WHERE active = 1')
-    .all() as GeofenceRow[];
+function resolveScopedSedeId(user: AuthenticatedUser, requestedSedeId?: unknown): number | null {
+  if (user.role === 'ADMIN') {
+    return user.sede_id ?? -1;
+  }
+  if (requestedSedeId !== undefined && requestedSedeId !== null && String(requestedSedeId).trim() !== '') {
+    const parsed = Number(requestedSedeId);
+    if (Number.isInteger(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function getSedeById(sedeId: number | null | undefined): SedeRow | null {
+  if (!sedeId) return null;
+  const row = db.prepare('SELECT * FROM sedes WHERE id = ?').get(sedeId) as SedeRow | undefined;
+  return row ?? null;
+}
+
+function getVehicleSedeInfo(vehicleId: number): { sede_id: number | null; sede_name: string } {
+  const row = db
+    .prepare(
+      `SELECT v.sede_id, COALESCE(s.name, '') AS sede_name
+       FROM vehicles v
+       LEFT JOIN sedes s ON s.id = v.sede_id
+       WHERE v.id = ?`
+    )
+    .get(vehicleId) as { sede_id: number | null; sede_name: string } | undefined;
+  return row ?? { sede_id: null, sede_name: '' };
+}
+
+function recordRoutePoint(
+  vehicleId: number,
+  userId: number,
+  eventDate: string,
+  recordedAt: string,
+  lat: number,
+  lng: number,
+  accuracy: number | null,
+  force = false
+): void {
+  if (!force) {
+    const last = db
+      .prepare(
+        `SELECT latitude, longitude, recorded_at FROM route_points
+         WHERE vehicle_id = ? AND event_date = ?
+         ORDER BY recorded_at DESC, id DESC LIMIT 1`
+      )
+      .get(vehicleId, eventDate) as { latitude: number; longitude: number; recorded_at: string } | undefined;
+
+    if (last) {
+      const dist = haversineMeters(last.latitude, last.longitude, lat, lng);
+      const elapsedSec = (new Date(recordedAt).getTime() - new Date(last.recorded_at).getTime()) / 1000;
+      if (dist < 25 && elapsedSec < 120) {
+        return;
+      }
+    }
+  }
+
+  db.prepare(
+    `INSERT INTO route_points (vehicle_id, user_id, event_date, recorded_at, latitude, longitude, accuracy_meters)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(vehicleId, userId, eventDate, recordedAt, lat, lng, accuracy);
+}
+
+function findMatchingGeofence(lat: number, lng: number, sedeId: number | null): GeofenceRow | null {
+  const activeGeofences = (
+    sedeId
+      ? db
+          .prepare(
+            'SELECT id, name, category, latitude, longitude, radius_meters, sede_id, active FROM geofences WHERE active = 1 AND (sede_id = ? OR sede_id IS NULL)'
+          )
+          .all(sedeId)
+      : db
+          .prepare('SELECT id, name, category, latitude, longitude, radius_meters, sede_id, active FROM geofences WHERE active = 1')
+          .all()
+  ) as GeofenceRow[];
 
   let closest: GeofenceRow | null = null;
   let closestDist = Infinity;
@@ -161,22 +271,12 @@ app.get('/api/auth/status', (_req: Request, res: Response) => {
     process.env.ADMIN_PASSWORD && process.env.ADMIN_PASSWORD.trim().length > 0
   );
   res.json({
-    needsInitialSetup: row.cnt === 0 && !envAdminConfigured,
+    needsInitialSetup: row.cnt === 0,
     envAdminConfigured,
   });
 });
 
 app.post('/api/auth/setup', (req: Request, res: Response) => {
-  const envAdminConfigured = Boolean(
-    process.env.ADMIN_PASSWORD && process.env.ADMIN_PASSWORD.trim().length > 0
-  );
-  if (envAdminConfigured) {
-    res.status(409).json({
-      error: 'La contraseña de gerencia está configurada mediante variables de entorno.',
-    });
-    return;
-  }
-
   const { username, password, full_name } = req.body ?? {};
   const cleanUser = typeof username === 'string' ? username.trim().toLowerCase() : '';
   const cleanName = typeof full_name === 'string' ? full_name.trim() : '';
@@ -195,7 +295,7 @@ app.post('/api/auth/setup', (req: Request, res: Response) => {
     return;
   }
   if (cleanName.length < 2) {
-    res.status(400).json({ error: 'Ingresa el nombre completo del administrador.' });
+    res.status(400).json({ error: 'Ingresa el nombre completo del gerente.' });
     return;
   }
 
@@ -211,8 +311,8 @@ app.post('/api/auth/setup', (req: Request, res: Response) => {
     }
     const result = db
       .prepare(
-        `INSERT INTO users (username, password_hash, full_name, role, vehicle_id, active, created_at)
-         VALUES (?, ?, ?, 'GERENCIA', NULL, 1, ?)`
+        `INSERT INTO users (username, password_hash, full_name, role, sede_id, vehicle_id, active, created_at)
+         VALUES (?, ?, ?, 'GERENCIA', NULL, NULL, 1, ?)`
       )
       .run(cleanUser, hash, cleanName, now);
     const createdId = Number(result.lastInsertRowid);
@@ -265,8 +365,8 @@ app.post('/api/auth/login', (req: Request, res: Response) => {
         const now = new Date().toISOString();
         const resInsert = db
           .prepare(
-            `INSERT INTO users (username, password_hash, full_name, role, vehicle_id, active, created_at)
-             VALUES (?, ?, 'Gerencia General', 'GERENCIA', NULL, 1, ?)`
+            `INSERT INTO users (username, password_hash, full_name, role, sede_id, vehicle_id, active, created_at)
+             VALUES (?, ?, 'Gerencia General', 'GERENCIA', NULL, NULL, 1, ?)`
           )
           .run(cleanUser, hash, now);
         adminUser = { id: Number(resInsert.lastInsertRowid), active: 1 };
@@ -288,7 +388,7 @@ app.post('/api/auth/login', (req: Request, res: Response) => {
   const dbUser = db
     .prepare('SELECT id, username, password_hash, role, active FROM users WHERE username = ?')
     .get(cleanUser) as
-    | { id: number; username: string; password_hash: string; role: string; active: number }
+    | { id: number; username: string; password_hash: string; role: UserRole; active: number }
     | undefined;
 
   if (!dbUser || dbUser.active !== 1) {
@@ -361,9 +461,14 @@ app.get('/api/driver/status', requireAuth, (req: AuthedRequest, res: Response) =
     | { current_geofence_id: number | null; entered_at: string | null; name: string | null; category: string | null }
     | undefined;
 
-  const gfCount = db
-    .prepare('SELECT COUNT(*) AS cnt FROM geofences WHERE active = 1')
-    .get() as { cnt: number };
+  const vehicleSede = getVehicleSedeInfo(user.vehicle_id);
+  const gfCount = (
+    vehicleSede.sede_id
+      ? db
+          .prepare('SELECT COUNT(*) AS cnt FROM geofences WHERE active = 1 AND (sede_id = ? OR sede_id IS NULL)')
+          .get(vehicleSede.sede_id)
+      : db.prepare('SELECT COUNT(*) AS cnt FROM geofences WHERE active = 1').get()
+  ) as { cnt: number };
 
   res.json({
     hasVehicle: true,
@@ -387,7 +492,7 @@ app.post('/api/driver/events', requireAuth, async (req: AuthedRequest, res: Resp
   const user = req.user!;
   if (!user.vehicle_id || !user.vehicle_code || !user.vehicle_plate) {
     res.status(400).json({
-      error: 'Tu usuario no tiene un camión asignado. Contacta a Gerencia.',
+      error: 'Tu usuario no tiene un camión asignado. Contacta al Administrador de tu sede o a Gerencia.',
     });
     return;
   }
@@ -423,7 +528,8 @@ app.post('/api/driver/events', requireAuth, async (req: AuthedRequest, res: Resp
     return;
   }
 
-  const matchedGf = findMatchingGeofence(coords.lat, coords.lng);
+  const vehicleSede = getVehicleSedeInfo(user.vehicle_id);
+  const matchedGf = findMatchingGeofence(coords.lat, coords.lng, vehicleSede.sede_id);
   const address = await reverseGeocode(coords.lat, coords.lng);
   const { eventDate, eventTime, recordedAt } = getServerDateParts();
   const eventUuid = crypto.randomUUID();
@@ -436,9 +542,10 @@ app.post('/api/driver/events', requireAuth, async (req: AuthedRequest, res: Resp
           latitude, longitude, accuracy_meters, address,
           user_id, username_snapshot, driver_name_snapshot,
           vehicle_id, vehicle_code_snapshot, vehicle_plate_snapshot,
+          sede_id, sede_name_snapshot,
           event_type, source, geofence_id, geofence_name_snapshot,
           notes, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL', ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL', ?, ?, ?, ?)`
       )
       .run(
         eventUuid,
@@ -455,12 +562,26 @@ app.post('/api/driver/events', requireAuth, async (req: AuthedRequest, res: Resp
         user.vehicle_id,
         user.vehicle_code,
         user.vehicle_plate,
+        vehicleSede.sede_id,
+        vehicleSede.sede_name,
         event_type,
         matchedGf ? matchedGf.id : null,
         matchedGf ? matchedGf.name : null,
         cleanNotes,
         recordedAt
       );
+
+    // Record GPS breadcrumb point for route tracing
+    recordRoutePoint(
+      user.vehicle_id!,
+      user.id,
+      eventDate,
+      recordedAt,
+      coords.lat,
+      coords.lng,
+      cleanAccuracy,
+      true
+    );
 
     // Sync geofence state cleanly
     if (event_type === 'FIN_JORNADA' || event_type === 'SALIDA') {
@@ -516,11 +637,33 @@ app.post('/api/driver/geofence-ping', requireAuth, async (req: AuthedRequest, re
     return;
   }
 
+  const cleanAccuracy =
+    typeof req.body?.accuracy_meters === 'number' &&
+    Number.isFinite(req.body.accuracy_meters) &&
+    req.body.accuracy_meters >= 0
+      ? Math.round(req.body.accuracy_meters * 10) / 10
+      : null;
+
   const shift = getVehicleShiftStatus(user.vehicle_id);
   if (!shift.shiftActive) {
     res.json({ triggeredEvents: [], currentGeofence: null });
     return;
   }
+
+  const vehicleSede = getVehicleSedeInfo(user.vehicle_id);
+  const { eventDate, eventTime, recordedAt } = getServerDateParts();
+
+  // Always store route breadcrumb while on shift (deduped by 25m / 120s)
+  recordRoutePoint(
+    user.vehicle_id,
+    user.id,
+    eventDate,
+    recordedAt,
+    coords.lat,
+    coords.lng,
+    cleanAccuracy,
+    false
+  );
 
   const currentState = db
     .prepare(
@@ -534,7 +677,7 @@ app.post('/api/driver/geofence-ping', requireAuth, async (req: AuthedRequest, re
     | undefined;
 
   const previousGfId = currentState?.current_geofence_id ?? null;
-  const matchedGf = findMatchingGeofence(coords.lat, coords.lng);
+  const matchedGf = findMatchingGeofence(coords.lat, coords.lng, vehicleSede.sede_id);
   const nextGfId = matchedGf ? matchedGf.id : null;
 
   if (previousGfId === nextGfId) {
@@ -545,7 +688,7 @@ app.post('/api/driver/geofence-ping', requireAuth, async (req: AuthedRequest, re
          last_lat = excluded.last_lat,
          last_lng = excluded.last_lng,
          updated_at = excluded.updated_at`
-    ).run(user.vehicle_id, previousGfId, coords.lat, coords.lng, new Date().toISOString());
+    ).run(user.vehicle_id, previousGfId, coords.lat, coords.lng, recordedAt);
 
     res.json({
       triggeredEvents: [],
@@ -557,7 +700,6 @@ app.post('/api/driver/geofence-ping', requireAuth, async (req: AuthedRequest, re
   }
 
   const address = await reverseGeocode(coords.lat, coords.lng);
-  const { eventDate, eventTime, recordedAt } = getServerDateParts();
   const triggeredEvents: EventRow[] = [];
 
   const insertAutoEvent = (
@@ -573,9 +715,10 @@ app.post('/api/driver/geofence-ping', requireAuth, async (req: AuthedRequest, re
           latitude, longitude, accuracy_meters, address,
           user_id, username_snapshot, driver_name_snapshot,
           vehicle_id, vehicle_code_snapshot, vehicle_plate_snapshot,
+          sede_id, sede_name_snapshot,
           event_type, source, geofence_id, geofence_name_snapshot,
           notes, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'GEOCERCA_AUTO', ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'GEOCERCA_AUTO', ?, ?, ?, ?)`
       )
       .run(
         crypto.randomUUID(),
@@ -584,6 +727,7 @@ app.post('/api/driver/geofence-ping', requireAuth, async (req: AuthedRequest, re
         recordedAt,
         coords.lat,
         coords.lng,
+        cleanAccuracy,
         address,
         user.id,
         user.username,
@@ -591,6 +735,8 @@ app.post('/api/driver/geofence-ping', requireAuth, async (req: AuthedRequest, re
         user.vehicle_id,
         user.vehicle_code,
         user.vehicle_plate,
+        vehicleSede.sede_id,
+        vehicleSede.sede_name,
         eventType,
         gfId,
         gfName,
@@ -642,51 +788,126 @@ app.post('/api/driver/geofence-ping', requireAuth, async (req: AuthedRequest, re
 });
 
 // ==========================================
+// SEDES ENDPOINT
+// ==========================================
+
+app.get('/api/admin/sedes', requireAuth, requireRole('GERENCIA', 'ADMIN'), (req: AuthedRequest, res: Response) => {
+  if (req.user!.role === 'ADMIN') {
+    const sedes = req.user!.sede_id
+      ? db.prepare('SELECT * FROM sedes WHERE id = ? AND active = 1').all(req.user!.sede_id)
+      : [];
+    res.json({ sedes });
+    return;
+  }
+  const sedes = db.prepare('SELECT * FROM sedes WHERE active = 1 ORDER BY id ASC').all();
+  res.json({ sedes });
+});
+
+// ==========================================
 // ADMIN / GERENCIA ROUTES
 // ==========================================
 
-app.get('/api/admin/dashboard', requireAuth, requireRole('GERENCIA'), (_req: AuthedRequest, res: Response) => {
+app.get('/api/admin/dashboard', requireAuth, requireRole('GERENCIA', 'ADMIN'), (req: AuthedRequest, res: Response) => {
+  const user = req.user!;
+  if (user.role === 'ADMIN' && !user.sede_id) {
+    res.status(403).json({ error: 'Tu usuario administrador no tiene una sede asignada.' });
+    return;
+  }
+
+  const scopedSedeId = resolveScopedSedeId(user, req.query.sedeId);
   const { eventDate } = getServerDateParts();
 
+  const vehicleWhere = scopedSedeId ? 'WHERE sede_id = ?' : '';
+  const vehicleActiveWhere = scopedSedeId ? 'WHERE active = 1 AND sede_id = ?' : 'WHERE active = 1';
+  const driverWhere = scopedSedeId
+    ? "WHERE role = 'CONDUCTOR' AND active = 1 AND sede_id = ?"
+    : "WHERE role = 'CONDUCTOR' AND active = 1";
+  const eventTodayWhere = scopedSedeId ? 'WHERE event_date = ? AND sede_id = ?' : 'WHERE event_date = ?';
+  const gfWhere = scopedSedeId ? 'WHERE active = 1 AND (sede_id = ? OR sede_id IS NULL)' : 'WHERE active = 1';
+
   const totalVehicles = (
-    db.prepare('SELECT COUNT(*) AS cnt FROM vehicles').get() as { cnt: number }
+    (scopedSedeId
+      ? db.prepare(`SELECT COUNT(*) AS cnt FROM vehicles ${vehicleWhere}`).get(scopedSedeId)
+      : db.prepare('SELECT COUNT(*) AS cnt FROM vehicles').get()) as { cnt: number }
   ).cnt;
+
   const activeVehiclesCount = (
-    db.prepare('SELECT COUNT(*) AS cnt FROM vehicles WHERE active = 1').get() as { cnt: number }
+    (scopedSedeId
+      ? db.prepare(`SELECT COUNT(*) AS cnt FROM vehicles ${vehicleActiveWhere}`).get(scopedSedeId)
+      : db.prepare('SELECT COUNT(*) AS cnt FROM vehicles WHERE active = 1').get()) as { cnt: number }
   ).cnt;
+
   const activeDriversCount = (
-    db.prepare("SELECT COUNT(*) AS cnt FROM users WHERE role = 'CONDUCTOR' AND active = 1").get() as { cnt: number }
+    (scopedSedeId
+      ? db.prepare(`SELECT COUNT(*) AS cnt FROM users ${driverWhere}`).get(scopedSedeId)
+      : db.prepare("SELECT COUNT(*) AS cnt FROM users WHERE role = 'CONDUCTOR' AND active = 1").get()) as { cnt: number }
   ).cnt;
+
   const eventsTodayCount = (
-    db.prepare('SELECT COUNT(*) AS cnt FROM events WHERE event_date = ?').get(eventDate) as { cnt: number }
+    (scopedSedeId
+      ? db.prepare(`SELECT COUNT(*) AS cnt FROM events ${eventTodayWhere}`).get(eventDate, scopedSedeId)
+      : db.prepare('SELECT COUNT(*) AS cnt FROM events WHERE event_date = ?').get(eventDate)) as { cnt: number }
   ).cnt;
+
   const entriesTodayCount = (
-    db.prepare("SELECT COUNT(*) AS cnt FROM events WHERE event_date = ? AND event_type = 'ENTRADA'").get(eventDate) as { cnt: number }
+    (scopedSedeId
+      ? db
+          .prepare("SELECT COUNT(*) AS cnt FROM events WHERE event_date = ? AND event_type = 'ENTRADA' AND sede_id = ?")
+          .get(eventDate, scopedSedeId)
+      : db
+          .prepare("SELECT COUNT(*) AS cnt FROM events WHERE event_date = ? AND event_type = 'ENTRADA'")
+          .get(eventDate)) as { cnt: number }
   ).cnt;
+
   const activeGeofencesCount = (
-    db.prepare('SELECT COUNT(*) AS cnt FROM geofences WHERE active = 1').get() as { cnt: number }
+    (scopedSedeId
+      ? db.prepare(`SELECT COUNT(*) AS cnt FROM geofences ${gfWhere}`).get(scopedSedeId)
+      : db.prepare('SELECT COUNT(*) AS cnt FROM geofences WHERE active = 1').get()) as { cnt: number }
   ).cnt;
 
-  const recentEvents = db
-    .prepare('SELECT * FROM events ORDER BY recorded_at DESC, id DESC LIMIT 15')
-    .all() as EventRow[];
+  const recentEvents = (
+    scopedSedeId
+      ? db
+          .prepare('SELECT * FROM events WHERE sede_id = ? ORDER BY recorded_at DESC, id DESC LIMIT 15')
+          .all(scopedSedeId)
+      : db.prepare('SELECT * FROM events ORDER BY recorded_at DESC, id DESC LIMIT 15').all()
+  ) as EventRow[];
 
-  const vehicles = db
-    .prepare(
-      `SELECT v.id, v.code, v.plate, v.brand, v.model, v.capacity_tons, v.active,
-              u.id AS driver_id, u.full_name AS driver_name, u.username AS driver_username
-       FROM vehicles v
-       LEFT JOIN users u ON u.vehicle_id = v.id AND u.role = 'CONDUCTOR' AND u.active = 1
-       WHERE v.active = 1
-       ORDER BY v.code ASC`
-    )
-    .all() as Array<{
+  const vehicles = (
+    scopedSedeId
+      ? db
+          .prepare(
+            `SELECT v.id, v.code, v.plate, v.brand, v.model, v.capacity_tons, v.sede_id, v.active,
+                    COALESCE(s.name, 'Sin sede') AS sede_name,
+                    u.id AS driver_id, u.full_name AS driver_name, u.username AS driver_username
+             FROM vehicles v
+             LEFT JOIN sedes s ON s.id = v.sede_id
+             LEFT JOIN users u ON u.vehicle_id = v.id AND u.role = 'CONDUCTOR' AND u.active = 1
+             WHERE v.active = 1 AND v.sede_id = ?
+             ORDER BY v.code ASC`
+          )
+          .all(scopedSedeId)
+      : db
+          .prepare(
+            `SELECT v.id, v.code, v.plate, v.brand, v.model, v.capacity_tons, v.sede_id, v.active,
+                    COALESCE(s.name, 'Sin sede') AS sede_name,
+                    u.id AS driver_id, u.full_name AS driver_name, u.username AS driver_username
+             FROM vehicles v
+             LEFT JOIN sedes s ON s.id = v.sede_id
+             LEFT JOIN users u ON u.vehicle_id = v.id AND u.role = 'CONDUCTOR' AND u.active = 1
+             WHERE v.active = 1
+             ORDER BY s.name ASC, v.code ASC`
+          )
+          .all()
+  ) as Array<{
     id: number;
     code: string;
     plate: string;
     brand: string;
     model: string;
     capacity_tons: number;
+    sede_id: number | null;
+    sede_name: string;
     active: number;
     driver_id: number | null;
     driver_name: string | null;
@@ -714,8 +935,52 @@ app.get('/api/admin/dashboard', requireAuth, requireRole('GERENCIA'), (_req: Aut
 
   const activeShiftsCount = fleetStatus.filter((v) => v.shiftActive).length;
 
+  // Build per-sede summaries so Gerencia can navigate sedes without seeing 40 trucks in one table
+  const allSedes = (
+    user.role === 'ADMIN'
+      ? db.prepare('SELECT * FROM sedes WHERE id = ? AND active = 1').all(user.sede_id)
+      : db.prepare('SELECT * FROM sedes WHERE active = 1 ORDER BY id ASC').all()
+  ) as SedeRow[];
+
+  const allActiveVehiclesForSummary = (
+    user.role === 'ADMIN'
+      ? db.prepare('SELECT id, sede_id FROM vehicles WHERE active = 1 AND sede_id = ?').all(user.sede_id)
+      : db.prepare('SELECT id, sede_id FROM vehicles WHERE active = 1').all()
+  ) as Array<{ id: number; sede_id: number | null }>;
+
+  const shiftByVehicleId = new Map<number, boolean>();
+  for (const av of allActiveVehiclesForSummary) {
+    shiftByVehicleId.set(av.id, getVehicleShiftStatus(av.id).shiftActive);
+  }
+
+  const sedeSummaries = allSedes.map((s) => {
+    const sedeVehicles = allActiveVehiclesForSummary.filter((v) => v.sede_id === s.id);
+    const sedeShifts = sedeVehicles.filter((v) => shiftByVehicleId.get(v.id)).length;
+    const sedeEventsToday = (
+      db
+        .prepare('SELECT COUNT(*) AS cnt FROM events WHERE event_date = ? AND sede_id = ?')
+        .get(eventDate, s.id) as { cnt: number }
+    ).cnt;
+    const sedeAdminsCount = (
+      db
+        .prepare("SELECT COUNT(*) AS cnt FROM users WHERE role = 'ADMIN' AND active = 1 AND sede_id = ?")
+        .get(s.id) as { cnt: number }
+    ).cnt;
+
+    return {
+      id: s.id,
+      name: s.name,
+      code: s.code,
+      vehiclesCount: sedeVehicles.length,
+      activeShiftsCount: sedeShifts,
+      eventsTodayCount: sedeEventsToday,
+      adminsCount: sedeAdminsCount,
+    };
+  });
+
   res.json({
     today: eventDate,
+    scopedSedeId,
     kpis: {
       totalVehicles,
       activeVehiclesCount,
@@ -725,16 +990,18 @@ app.get('/api/admin/dashboard', requireAuth, requireRole('GERENCIA'), (_req: Aut
       entriesTodayCount,
       activeGeofencesCount,
     },
+    sedeSummaries,
     recentEvents,
     fleetStatus,
   });
 });
 
-app.get('/api/admin/events', requireAuth, requireRole('GERENCIA'), (req: AuthedRequest, res: Response) => {
+app.get('/api/admin/events', requireAuth, requireRole('GERENCIA', 'ADMIN'), (req: AuthedRequest, res: Response) => {
   const {
     date,
     startDate,
     endDate,
+    sedeId,
     vehicleId,
     userId,
     eventType,
@@ -744,8 +1011,14 @@ app.get('/api/admin/events', requireAuth, requireRole('GERENCIA'), (req: AuthedR
     offset = '0',
   } = req.query;
 
+  const scopedSedeId = resolveScopedSedeId(req.user!, sedeId);
   const conditions: string[] = [];
   const params: unknown[] = [];
+
+  if (scopedSedeId) {
+    conditions.push('sede_id = ?');
+    params.push(scopedSedeId);
+  }
 
   if (typeof date === 'string' && date.trim()) {
     conditions.push('event_date = ?');
@@ -780,9 +1053,9 @@ app.get('/api/admin/events', requireAuth, requireRole('GERENCIA'), (req: AuthedR
   if (typeof search === 'string' && search.trim()) {
     const pattern = `%${search.trim()}%`;
     conditions.push(
-      '(address LIKE ? OR notes LIKE ? OR driver_name_snapshot LIKE ? OR vehicle_code_snapshot LIKE ? OR vehicle_plate_snapshot LIKE ? OR geofence_name_snapshot LIKE ?)'
+      '(address LIKE ? OR notes LIKE ? OR driver_name_snapshot LIKE ? OR vehicle_code_snapshot LIKE ? OR vehicle_plate_snapshot LIKE ? OR geofence_name_snapshot LIKE ? OR sede_name_snapshot LIKE ?)'
     );
-    params.push(pattern, pattern, pattern, pattern, pattern, pattern);
+    params.push(pattern, pattern, pattern, pattern, pattern, pattern, pattern);
   }
 
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -804,20 +1077,34 @@ app.get('/api/admin/events', requireAuth, requireRole('GERENCIA'), (req: AuthedR
   res.json({ events, total: totalRow.cnt });
 });
 
-app.get('/api/admin/route', requireAuth, requireRole('GERENCIA'), (req: AuthedRequest, res: Response) => {
+app.get('/api/admin/route', requireAuth, requireRole('GERENCIA', 'ADMIN'), (req: AuthedRequest, res: Response) => {
   const vehicleId = Number(req.query.vehicleId);
-  const date = typeof req.query.date === 'string' && req.query.date.trim()
-    ? req.query.date.trim()
-    : getServerDateParts().eventDate;
+  const date =
+    typeof req.query.date === 'string' && req.query.date.trim()
+      ? req.query.date.trim()
+      : getServerDateParts().eventDate;
 
   if (!Number.isInteger(vehicleId) || vehicleId <= 0) {
     res.status(400).json({ error: 'Selecciona un vehículo válido.' });
     return;
   }
 
-  const vehicle = db.prepare('SELECT * FROM vehicles WHERE id = ?').get(vehicleId);
+  const vehicle = db
+    .prepare(
+      `SELECT v.*, COALESCE(s.name, '') AS sede_name, s.latitude AS sede_lat, s.longitude AS sede_lng
+       FROM vehicles v
+       LEFT JOIN sedes s ON s.id = v.sede_id
+       WHERE v.id = ?`
+    )
+    .get(vehicleId) as (VehicleRow & { sede_name: string; sede_lat: number | null; sede_lng: number | null }) | undefined;
+
   if (!vehicle) {
     res.status(404).json({ error: 'Vehículo no encontrado.' });
+    return;
+  }
+
+  if (req.user!.role === 'ADMIN' && vehicle.sede_id !== req.user!.sede_id) {
+    res.status(403).json({ error: 'Este vehículo pertenece a otra sede.' });
     return;
   }
 
@@ -829,13 +1116,37 @@ app.get('/api/admin/route', requireAuth, requireRole('GERENCIA'), (req: AuthedRe
     )
     .all(vehicleId, date) as EventRow[];
 
+  const routePoints = db
+    .prepare(
+      `SELECT * FROM route_points
+       WHERE vehicle_id = ? AND event_date = ?
+       ORDER BY recorded_at ASC, id ASC`
+    )
+    .all(vehicleId, date) as RoutePointRow[];
+
+  // Collect all chronological trace coordinates (events + GPS breadcrumbs)
+  const combinedTrace = [
+    ...events.map((e) => ({
+      recorded_at: e.recorded_at,
+      latitude: e.latitude,
+      longitude: e.longitude,
+      kind: 'event' as const,
+    })),
+    ...routePoints.map((p) => ({
+      recorded_at: p.recorded_at,
+      latitude: p.latitude,
+      longitude: p.longitude,
+      kind: 'gps' as const,
+    })),
+  ].sort((a, b) => a.recorded_at.localeCompare(b.recorded_at));
+
   let totalDistanceMeters = 0;
-  for (let i = 1; i < events.length; i++) {
+  for (let i = 1; i < combinedTrace.length; i++) {
     totalDistanceMeters += haversineMeters(
-      events[i - 1].latitude,
-      events[i - 1].longitude,
-      events[i].latitude,
-      events[i].longitude
+      combinedTrace[i - 1].latitude,
+      combinedTrace[i - 1].longitude,
+      combinedTrace[i].latitude,
+      combinedTrace[i].longitude
     );
   }
 
@@ -860,17 +1171,34 @@ app.get('/api/admin/route', requireAuth, requireRole('GERENCIA'), (req: AuthedRe
     );
   }
 
-  const geofences = db
-    .prepare('SELECT * FROM geofences WHERE active = 1 ORDER BY name ASC')
-    .all();
+  const geofences = vehicle.sede_id
+    ? db
+        .prepare('SELECT * FROM geofences WHERE active = 1 AND (sede_id = ? OR sede_id IS NULL) ORDER BY name ASC')
+        .all(vehicle.sede_id)
+    : db.prepare('SELECT * FROM geofences WHERE active = 1 ORDER BY name ASC').all();
+
+  const availableDatesRows = db
+    .prepare(
+      `SELECT event_date FROM (
+         SELECT DISTINCT event_date FROM events WHERE vehicle_id = ?
+         UNION
+         SELECT DISTINCT event_date FROM route_points WHERE vehicle_id = ?
+       )
+       ORDER BY event_date DESC
+       LIMIT 15`
+    )
+    .all(vehicleId, vehicleId) as Array<{ event_date: string }>;
 
   res.json({
     vehicle,
     date,
     events,
+    routePoints,
     geofences,
+    availableDates: availableDatesRows.map((r) => r.event_date),
     summary: {
       totalEvents: events.length,
+      gpsPointsCount: routePoints.length,
       entriesCount: events.filter((e) => e.event_type === 'ENTRADA').length,
       exitsCount: events.filter((e) => e.event_type === 'SALIDA').length,
       distanceKm: Math.round((totalDistanceMeters / 1000) * 100) / 100,
@@ -880,18 +1208,166 @@ app.get('/api/admin/route', requireAuth, requireRole('GERENCIA'), (req: AuthedRe
 });
 
 // ==========================================
+// PLANNED ROUTES CRUD (MAP DIGITIZER)
+// ==========================================
+
+app.get('/api/admin/planned-routes', requireAuth, requireRole('GERENCIA', 'ADMIN'), (req: AuthedRequest, res: Response) => {
+  const scopedSedeId = resolveScopedSedeId(req.user!, req.query.sedeId);
+  const routes = scopedSedeId
+    ? db
+        .prepare(
+          `SELECT r.*, s.name AS sede_name, v.code AS vehicle_code, v.plate AS vehicle_plate
+           FROM planned_routes r
+           LEFT JOIN sedes s ON s.id = r.sede_id
+           LEFT JOIN vehicles v ON v.id = r.vehicle_id
+           WHERE r.sede_id = ? OR r.sede_id IS NULL
+           ORDER BY r.updated_at DESC`
+        )
+        .all(scopedSedeId)
+    : db
+        .prepare(
+          `SELECT r.*, s.name AS sede_name, v.code AS vehicle_code, v.plate AS vehicle_plate
+           FROM planned_routes r
+           LEFT JOIN sedes s ON s.id = r.sede_id
+           LEFT JOIN vehicles v ON v.id = r.vehicle_id
+           ORDER BY r.updated_at DESC`
+        )
+        .all();
+
+  res.json({ routes });
+});
+
+app.post('/api/admin/planned-routes', requireAuth, requireRole('GERENCIA', 'ADMIN'), (req: AuthedRequest, res: Response) => {
+  const { name, sede_id, vehicle_id, waypoints, distance_km } = req.body ?? {};
+  const cleanName = typeof name === 'string' ? name.trim() : '';
+  if (cleanName.length < 2 || cleanName.length > 120) {
+    res.status(400).json({ error: 'El nombre de la ruta debe tener entre 2 y 120 caracteres.' });
+    return;
+  }
+  if (!Array.isArray(waypoints) || waypoints.length < 2) {
+    res.status(400).json({ error: 'La ruta debe tener al menos 2 puntos en el mapa.' });
+    return;
+  }
+
+  const cleanWaypoints: Array<{ lat: number; lng: number; label?: string }> = [];
+  for (const wp of waypoints) {
+    const c = validateCoords(wp?.lat, wp?.lng);
+    if (!c) {
+      res.status(400).json({ error: 'Uno de los puntos de la ruta tiene coordenadas inválidas.' });
+      return;
+    }
+    cleanWaypoints.push({
+      lat: c.lat,
+      lng: c.lng,
+      label: typeof wp?.label === 'string' ? wp.label.trim().slice(0, 80) : undefined,
+    });
+  }
+
+  let effectiveSedeId: number | null =
+    req.user!.role === 'ADMIN'
+      ? req.user!.sede_id
+      : sede_id
+        ? Number(sede_id)
+        : null;
+
+  const cleanVehicleId = vehicle_id ? Number(vehicle_id) : null;
+  if (cleanVehicleId) {
+    const v = db.prepare('SELECT id, sede_id FROM vehicles WHERE id = ?').get(cleanVehicleId) as
+      | { id: number; sede_id: number | null }
+      | undefined;
+    if (!v) {
+      res.status(400).json({ error: 'Vehículo seleccionado inválido.' });
+      return;
+    }
+    if (req.user!.role === 'ADMIN' && v.sede_id !== req.user!.sede_id) {
+      res.status(403).json({ error: 'No puedes asignar rutas a vehículos de otra sede.' });
+      return;
+    }
+    if (!effectiveSedeId) {
+      effectiveSedeId = v.sede_id;
+    }
+  }
+
+  const distKm = Number.isFinite(Number(distance_km)) ? Math.round(Number(distance_km) * 100) / 100 : 0;
+  const now = new Date().toISOString();
+
+  const info = db
+    .prepare(
+      `INSERT INTO planned_routes (name, sede_id, vehicle_id, waypoints_json, distance_km, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      cleanName,
+      effectiveSedeId,
+      cleanVehicleId,
+      JSON.stringify(cleanWaypoints),
+      distKm,
+      req.user!.id,
+      now,
+      now
+    );
+
+  const created = db
+    .prepare(
+      `SELECT r.*, s.name AS sede_name, v.code AS vehicle_code, v.plate AS vehicle_plate
+       FROM planned_routes r
+       LEFT JOIN sedes s ON s.id = r.sede_id
+       LEFT JOIN vehicles v ON v.id = r.vehicle_id
+       WHERE r.id = ?`
+    )
+    .get(Number(info.lastInsertRowid));
+
+  logAudit(req.user!.id, 'PLANNED_ROUTE_CREATE', `Ruta trazada guardada: ${cleanName} (${cleanWaypoints.length} puntos)`);
+  res.status(201).json({ route: created });
+});
+
+app.delete('/api/admin/planned-routes/:id', requireAuth, requireRole('GERENCIA', 'ADMIN'), (req: AuthedRequest, res: Response) => {
+  const id = Number(req.params.id);
+  const existing = db.prepare('SELECT * FROM planned_routes WHERE id = ?').get(id) as
+    | { id: number; name: string; sede_id: number | null }
+    | undefined;
+  if (!existing) {
+    res.status(404).json({ error: 'Ruta planificada no encontrada.' });
+    return;
+  }
+  if (req.user!.role === 'ADMIN' && existing.sede_id !== req.user!.sede_id) {
+    res.status(403).json({ error: 'No puedes eliminar rutas de otra sede.' });
+    return;
+  }
+  db.prepare('DELETE FROM planned_routes WHERE id = ?').run(id);
+  logAudit(req.user!.id, 'PLANNED_ROUTE_DELETE', `Ruta planificada eliminada: ${existing.name} (#${id})`);
+  res.json({ deleted: true });
+});
+
+// ==========================================
 // GEOFENCES CRUD
 // ==========================================
 
-app.get('/api/admin/geofences', requireAuth, requireRole('GERENCIA'), (_req: AuthedRequest, res: Response) => {
-  const geofences = db
-    .prepare('SELECT * FROM geofences ORDER BY active DESC, name ASC')
-    .all();
+app.get('/api/admin/geofences', requireAuth, requireRole('GERENCIA', 'ADMIN'), (req: AuthedRequest, res: Response) => {
+  const scopedSedeId = resolveScopedSedeId(req.user!, req.query.sedeId);
+  const geofences = scopedSedeId
+    ? db
+        .prepare(
+          `SELECT g.*, COALESCE(s.name, 'Todas las sedes') AS sede_name
+           FROM geofences g
+           LEFT JOIN sedes s ON s.id = g.sede_id
+           WHERE g.sede_id = ? OR g.sede_id IS NULL
+           ORDER BY g.active DESC, g.name ASC`
+        )
+        .all(scopedSedeId)
+    : db
+        .prepare(
+          `SELECT g.*, COALESCE(s.name, 'Todas las sedes') AS sede_name
+           FROM geofences g
+           LEFT JOIN sedes s ON s.id = g.sede_id
+           ORDER BY g.active DESC, g.name ASC`
+        )
+        .all();
   res.json({ geofences });
 });
 
-app.post('/api/admin/geofences', requireAuth, requireRole('GERENCIA'), (req: AuthedRequest, res: Response) => {
-  const { name, category, latitude, longitude, radius_meters, active = true } = req.body ?? {};
+app.post('/api/admin/geofences', requireAuth, requireRole('GERENCIA', 'ADMIN'), (req: AuthedRequest, res: Response) => {
+  const { name, category, latitude, longitude, radius_meters, sede_id, active = true } = req.body ?? {};
   const cleanName = typeof name === 'string' ? name.trim() : '';
   const cleanCategory = VALID_CATEGORIES.includes(category) ? category : null;
   const coords = validateCoords(latitude, longitude);
@@ -914,11 +1390,23 @@ app.post('/api/admin/geofences', requireAuth, requireRole('GERENCIA'), (req: Aut
     return;
   }
 
+  let effectiveSedeId: number | null = null;
+  if (req.user!.role === 'ADMIN') {
+    effectiveSedeId = req.user!.sede_id;
+  } else if (sede_id !== undefined && sede_id !== null && String(sede_id).trim() !== '') {
+    const s = getSedeById(Number(sede_id));
+    if (!s) {
+      res.status(400).json({ error: 'Sede inválida.' });
+      return;
+    }
+    effectiveSedeId = s.id;
+  }
+
   const now = new Date().toISOString();
   const info = db
     .prepare(
-      `INSERT INTO geofences (name, category, latitude, longitude, radius_meters, active, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO geofences (name, category, latitude, longitude, radius_meters, sede_id, active, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       cleanName,
@@ -926,6 +1414,7 @@ app.post('/api/admin/geofences', requireAuth, requireRole('GERENCIA'), (req: Aut
       coords.lat,
       coords.lng,
       Math.round(radius),
+      effectiveSedeId,
       active ? 1 : 0,
       req.user!.id,
       now,
@@ -933,21 +1422,30 @@ app.post('/api/admin/geofences', requireAuth, requireRole('GERENCIA'), (req: Aut
     );
 
   const created = db
-    .prepare('SELECT * FROM geofences WHERE id = ?')
+    .prepare(
+      `SELECT g.*, COALESCE(s.name, 'Todas las sedes') AS sede_name
+       FROM geofences g
+       LEFT JOIN sedes s ON s.id = g.sede_id
+       WHERE g.id = ?`
+    )
     .get(Number(info.lastInsertRowid));
   logAudit(req.user!.id, 'GEOFENCE_CREATE', `Geocerca creada: ${cleanName} (${cleanCategory}, ${Math.round(radius)}m)`);
   res.status(201).json({ geofence: created });
 });
 
-app.put('/api/admin/geofences/:id', requireAuth, requireRole('GERENCIA'), (req: AuthedRequest, res: Response) => {
+app.put('/api/admin/geofences/:id', requireAuth, requireRole('GERENCIA', 'ADMIN'), (req: AuthedRequest, res: Response) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM geofences WHERE id = ?').get(id) as GeofenceRow | undefined;
   if (!existing) {
     res.status(404).json({ error: 'Geocerca no encontrada.' });
     return;
   }
+  if (req.user!.role === 'ADMIN' && existing.sede_id !== req.user!.sede_id) {
+    res.status(403).json({ error: 'No puedes modificar geocercas de otra sede.' });
+    return;
+  }
 
-  const { name, category, latitude, longitude, radius_meters, active } = req.body ?? {};
+  const { name, category, latitude, longitude, radius_meters, sede_id, active } = req.body ?? {};
   const cleanName = typeof name === 'string' ? name.trim() : existing.name;
   const cleanCategory = category !== undefined ? (VALID_CATEGORIES.includes(category) ? category : null) : existing.category;
   const coords =
@@ -957,6 +1455,20 @@ app.put('/api/admin/geofences/:id', requireAuth, requireRole('GERENCIA'), (req: 
   const radius = radius_meters !== undefined ? Number(radius_meters) : existing.radius_meters;
   const isActive = active !== undefined ? (active ? 1 : 0) : existing.active;
 
+  let effectiveSedeId = existing.sede_id;
+  if (req.user!.role === 'GERENCIA' && sede_id !== undefined) {
+    if (sede_id === null || String(sede_id).trim() === '') {
+      effectiveSedeId = null;
+    } else {
+      const s = getSedeById(Number(sede_id));
+      if (!s) {
+        res.status(400).json({ error: 'Sede inválida.' });
+        return;
+      }
+      effectiveSedeId = s.id;
+    }
+  }
+
   if (cleanName.length < 2 || cleanName.length > 120 || !cleanCategory || !coords || !Number.isFinite(radius) || radius < 20 || radius > 50000) {
     res.status(400).json({ error: 'Datos de geocerca inválidos.' });
     return;
@@ -965,20 +1477,31 @@ app.put('/api/admin/geofences/:id', requireAuth, requireRole('GERENCIA'), (req: 
   const now = new Date().toISOString();
   db.prepare(
     `UPDATE geofences
-     SET name = ?, category = ?, latitude = ?, longitude = ?, radius_meters = ?, active = ?, updated_at = ?
+     SET name = ?, category = ?, latitude = ?, longitude = ?, radius_meters = ?, sede_id = ?, active = ?, updated_at = ?
      WHERE id = ?`
-  ).run(cleanName, cleanCategory, coords.lat, coords.lng, Math.round(radius), isActive, now, id);
+  ).run(cleanName, cleanCategory, coords.lat, coords.lng, Math.round(radius), effectiveSedeId, isActive, now, id);
 
-  const updated = db.prepare('SELECT * FROM geofences WHERE id = ?').get(id);
+  const updated = db
+    .prepare(
+      `SELECT g.*, COALESCE(s.name, 'Todas las sedes') AS sede_name
+       FROM geofences g
+       LEFT JOIN sedes s ON s.id = g.sede_id
+       WHERE g.id = ?`
+    )
+    .get(id);
   logAudit(req.user!.id, 'GEOFENCE_UPDATE', `Geocerca #${id} actualizada: ${cleanName}`);
   res.json({ geofence: updated });
 });
 
-app.delete('/api/admin/geofences/:id', requireAuth, requireRole('GERENCIA'), (req: AuthedRequest, res: Response) => {
+app.delete('/api/admin/geofences/:id', requireAuth, requireRole('GERENCIA', 'ADMIN'), (req: AuthedRequest, res: Response) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM geofences WHERE id = ?').get(id) as GeofenceRow | undefined;
   if (!existing) {
     res.status(404).json({ error: 'Geocerca no encontrada.' });
+    return;
+  }
+  if (req.user!.role === 'ADMIN' && existing.sede_id !== req.user!.sede_id) {
+    res.status(403).json({ error: 'No puedes eliminar geocercas de otra sede.' });
     return;
   }
   db.prepare('DELETE FROM geofences WHERE id = ?').run(id);
@@ -990,41 +1513,65 @@ app.delete('/api/admin/geofences/:id', requireAuth, requireRole('GERENCIA'), (re
 // VEHICLES & USERS CRUD
 // ==========================================
 
-app.get('/api/admin/vehicles', requireAuth, requireRole('GERENCIA'), (_req: AuthedRequest, res: Response) => {
-  const vehicles = db
-    .prepare(
-      `SELECT v.*, u.id AS assigned_user_id, u.full_name AS assigned_driver_name, u.username AS assigned_username
-       FROM vehicles v
-       LEFT JOIN users u ON u.vehicle_id = v.id AND u.role = 'CONDUCTOR' AND u.active = 1
-       ORDER BY v.code ASC`
-    )
-    .all();
+app.get('/api/admin/vehicles', requireAuth, requireRole('GERENCIA', 'ADMIN'), (req: AuthedRequest, res: Response) => {
+  const scopedSedeId = resolveScopedSedeId(req.user!, req.query.sedeId);
+  const vehicles = scopedSedeId
+    ? db
+        .prepare(
+          `SELECT v.*, COALESCE(s.name, 'Sin sede') AS sede_name,
+                  u.id AS assigned_user_id, u.full_name AS assigned_driver_name, u.username AS assigned_username
+           FROM vehicles v
+           LEFT JOIN sedes s ON s.id = v.sede_id
+           LEFT JOIN users u ON u.vehicle_id = v.id AND u.role = 'CONDUCTOR' AND u.active = 1
+           WHERE v.sede_id = ?
+           ORDER BY v.code ASC`
+        )
+        .all(scopedSedeId)
+    : db
+        .prepare(
+          `SELECT v.*, COALESCE(s.name, 'Sin sede') AS sede_name,
+                  u.id AS assigned_user_id, u.full_name AS assigned_driver_name, u.username AS assigned_username
+           FROM vehicles v
+           LEFT JOIN sedes s ON s.id = v.sede_id
+           LEFT JOIN users u ON u.vehicle_id = v.id AND u.role = 'CONDUCTOR' AND u.active = 1
+           ORDER BY s.name ASC, v.code ASC`
+        )
+        .all();
   res.json({ vehicles });
 });
 
 app.post('/api/admin/vehicles', requireAuth, requireRole('GERENCIA'), (req: AuthedRequest, res: Response) => {
-  const { code, plate, brand = '', model = '', capacity_tons = 0 } = req.body ?? {};
+  const { code, plate, brand = '', model = '', capacity_tons = 0, sede_id } = req.body ?? {};
   const cleanCode = typeof code === 'string' ? code.trim().toUpperCase() : '';
   const cleanPlate = typeof plate === 'string' ? plate.trim().toUpperCase() : '';
   const cleanBrand = typeof brand === 'string' ? brand.trim() : '';
   const cleanModel = typeof model === 'string' ? model.trim() : '';
   const cap = Number(capacity_tons) || 0;
+  const sede = getSedeById(Number(sede_id));
 
   if (cleanCode.length < 2 || cleanPlate.length < 3) {
     res.status(400).json({ error: 'El código interno y la placa son obligatorios.' });
+    return;
+  }
+  if (!sede) {
+    res.status(400).json({ error: 'Debes asignar el camión a una de las 8 sedes.' });
     return;
   }
 
   try {
     const info = db
       .prepare(
-        `INSERT INTO vehicles (code, plate, brand, model, capacity_tons, active, created_at)
-         VALUES (?, ?, ?, ?, ?, 1, ?)`
+        `INSERT INTO vehicles (code, plate, brand, model, capacity_tons, sede_id, active, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?)`
       )
-      .run(cleanCode, cleanPlate, cleanBrand, cleanModel, cap, new Date().toISOString());
+      .run(cleanCode, cleanPlate, cleanBrand, cleanModel, cap, sede.id, new Date().toISOString());
 
-    const vehicle = db.prepare('SELECT * FROM vehicles WHERE id = ?').get(Number(info.lastInsertRowid));
-    logAudit(req.user!.id, 'VEHICLE_CREATE', `Vehículo creado: ${cleanCode} (${cleanPlate})`);
+    const vehicle = db
+      .prepare(
+        `SELECT v.*, s.name AS sede_name FROM vehicles v LEFT JOIN sedes s ON s.id = v.sede_id WHERE v.id = ?`
+      )
+      .get(Number(info.lastInsertRowid));
+    logAudit(req.user!.id, 'VEHICLE_CREATE', `Vehículo creado: ${cleanCode} (${cleanPlate}) en sede ${sede.name}`);
     res.status(201).json({ vehicle });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : '';
@@ -1038,15 +1585,13 @@ app.post('/api/admin/vehicles', requireAuth, requireRole('GERENCIA'), (req: Auth
 
 app.put('/api/admin/vehicles/:id', requireAuth, requireRole('GERENCIA'), (req: AuthedRequest, res: Response) => {
   const id = Number(req.params.id);
-  const existing = db.prepare('SELECT * FROM vehicles WHERE id = ?').get(id) as
-    | { id: number; code: string; plate: string; brand: string; model: string; capacity_tons: number; active: number }
-    | undefined;
+  const existing = db.prepare('SELECT * FROM vehicles WHERE id = ?').get(id) as VehicleRow | undefined;
   if (!existing) {
     res.status(404).json({ error: 'Vehículo no encontrado.' });
     return;
   }
 
-  const { code, plate, brand, model, capacity_tons, active } = req.body ?? {};
+  const { code, plate, brand, model, capacity_tons, sede_id, active } = req.body ?? {};
   const cleanCode = typeof code === 'string' ? code.trim().toUpperCase() : existing.code;
   const cleanPlate = typeof plate === 'string' ? plate.trim().toUpperCase() : existing.plate;
   const cleanBrand = typeof brand === 'string' ? brand.trim() : existing.brand;
@@ -1054,12 +1599,36 @@ app.put('/api/admin/vehicles/:id', requireAuth, requireRole('GERENCIA'), (req: A
   const cap = capacity_tons !== undefined ? Number(capacity_tons) || 0 : existing.capacity_tons;
   const isActive = active !== undefined ? (active ? 1 : 0) : existing.active;
 
-  try {
-    db.prepare(
-      `UPDATE vehicles SET code = ?, plate = ?, brand = ?, model = ?, capacity_tons = ?, active = ? WHERE id = ?`
-    ).run(cleanCode, cleanPlate, cleanBrand, cleanModel, cap, isActive, id);
+  let cleanSedeId = existing.sede_id;
+  if (sede_id !== undefined) {
+    const sede = getSedeById(Number(sede_id));
+    if (!sede) {
+      res.status(400).json({ error: 'Sede inválida.' });
+      return;
+    }
+    cleanSedeId = sede.id;
+  }
 
-    const vehicle = db.prepare('SELECT * FROM vehicles WHERE id = ?').get(id);
+  try {
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE vehicles SET code = ?, plate = ?, brand = ?, model = ?, capacity_tons = ?, sede_id = ?, active = ? WHERE id = ?`
+      ).run(cleanCode, cleanPlate, cleanBrand, cleanModel, cap, cleanSedeId, isActive, id);
+
+      // Keep assigned driver's sede_id synced with their vehicle's sede_id
+      if (cleanSedeId !== existing.sede_id) {
+        db.prepare("UPDATE users SET sede_id = ? WHERE vehicle_id = ? AND role = 'CONDUCTOR'").run(
+          cleanSedeId,
+          id
+        );
+      }
+    })();
+
+    const vehicle = db
+      .prepare(
+        `SELECT v.*, COALESCE(s.name, 'Sin sede') AS sede_name FROM vehicles v LEFT JOIN sedes s ON s.id = v.sede_id WHERE v.id = ?`
+      )
+      .get(id);
     logAudit(req.user!.id, 'VEHICLE_UPDATE', `Vehículo actualizado: ${cleanCode} (${cleanPlate})`);
     res.json({ vehicle });
   } catch (err: unknown) {
@@ -1072,27 +1641,80 @@ app.put('/api/admin/vehicles/:id', requireAuth, requireRole('GERENCIA'), (req: A
   }
 });
 
-app.get('/api/admin/users', requireAuth, requireRole('GERENCIA'), (_req: AuthedRequest, res: Response) => {
-  const users = db
-    .prepare(
-      `SELECT u.id, u.username, u.full_name, u.role, u.vehicle_id, u.active, u.created_at,
-              v.code AS vehicle_code, v.plate AS vehicle_plate
-       FROM users u
-       LEFT JOIN vehicles v ON v.id = u.vehicle_id
-       ORDER BY u.role DESC, u.full_name ASC`
-    )
-    .all();
+app.get('/api/admin/users', requireAuth, requireRole('GERENCIA', 'ADMIN'), (req: AuthedRequest, res: Response) => {
+  const user = req.user!;
+  if (user.role === 'ADMIN') {
+    if (!user.sede_id) {
+      res.json({ users: [] });
+      return;
+    }
+    const users = db
+      .prepare(
+        `SELECT u.id, u.username, u.full_name, u.role, u.sede_id, u.vehicle_id, u.active, u.created_at,
+                s.name AS sede_name,
+                v.code AS vehicle_code, v.plate AS vehicle_plate
+         FROM users u
+         LEFT JOIN sedes s ON s.id = u.sede_id
+         LEFT JOIN vehicles v ON v.id = u.vehicle_id
+         WHERE u.role = 'CONDUCTOR' AND u.sede_id = ?
+         ORDER BY u.full_name ASC`
+      )
+      .all(user.sede_id);
+    res.json({ users });
+    return;
+  }
+
+  const scopedSedeId = resolveScopedSedeId(user, req.query.sedeId);
+  const users = scopedSedeId
+    ? db
+        .prepare(
+          `SELECT u.id, u.username, u.full_name, u.role, u.sede_id, u.vehicle_id, u.active, u.created_at,
+                  COALESCE(s.name, 'Todas las sedes') AS sede_name,
+                  v.code AS vehicle_code, v.plate AS vehicle_plate
+           FROM users u
+           LEFT JOIN sedes s ON s.id = u.sede_id
+           LEFT JOIN vehicles v ON v.id = u.vehicle_id
+           WHERE u.sede_id = ? OR u.role = 'GERENCIA'
+           ORDER BY u.role DESC, u.full_name ASC`
+        )
+        .all(scopedSedeId)
+    : db
+        .prepare(
+          `SELECT u.id, u.username, u.full_name, u.role, u.sede_id, u.vehicle_id, u.active, u.created_at,
+                  COALESCE(s.name, 'Todas las sedes') AS sede_name,
+                  v.code AS vehicle_code, v.plate AS vehicle_plate
+           FROM users u
+           LEFT JOIN sedes s ON s.id = u.sede_id
+           LEFT JOIN vehicles v ON v.id = u.vehicle_id
+           ORDER BY u.role DESC, s.name ASC, u.full_name ASC`
+        )
+        .all();
+
   res.json({ users });
 });
 
-app.post('/api/admin/users', requireAuth, requireRole('GERENCIA'), (req: AuthedRequest, res: Response) => {
-  const { username, password, full_name, role, vehicle_id } = req.body ?? {};
+app.post('/api/admin/users', requireAuth, requireRole('GERENCIA', 'ADMIN'), (req: AuthedRequest, res: Response) => {
+  const actor = req.user!;
+  const { username, password, full_name, role, sede_id, vehicle_id } = req.body ?? {};
   const cleanUser = typeof username === 'string' ? username.trim().toLowerCase() : '';
   const cleanName = typeof full_name === 'string' ? full_name.trim() : '';
   const cleanPass = typeof password === 'string' ? password : '';
-  const cleanRole = role === 'GERENCIA' ? 'GERENCIA' : 'CONDUCTOR';
-  const cleanVehicleId =
-    cleanRole === 'CONDUCTOR' && vehicle_id ? Number(vehicle_id) : null;
+
+  let cleanRole: UserRole = 'CONDUCTOR';
+  if (role === 'GERENCIA' || role === 'ADMIN' || role === 'CONDUCTOR') {
+    cleanRole = role;
+  }
+
+  if (actor.role === 'ADMIN') {
+    if (cleanRole !== 'CONDUCTOR') {
+      res.status(403).json({ error: 'Un Administrador de Sede solo puede crear usuarios Conductores.' });
+      return;
+    }
+    if (!actor.sede_id) {
+      res.status(403).json({ error: 'Tu usuario administrador no tiene una sede asignada.' });
+      return;
+    }
+  }
 
   if (cleanUser.length < 3 || !/^[a-z0-9._-]+$/.test(cleanUser)) {
     res.status(400).json({ error: 'Usuario inválido (mínimo 3 caracteres alfanuméricos).' });
@@ -1106,22 +1728,52 @@ app.post('/api/admin/users', requireAuth, requireRole('GERENCIA'), (req: AuthedR
     res.status(400).json({ error: 'El nombre completo es obligatorio.' });
     return;
   }
-  if (cleanRole === 'CONDUCTOR' && !cleanVehicleId) {
-    res.status(400).json({ error: 'Todo conductor debe tener un camión asignado.' });
-    return;
+
+  let cleanVehicleId: number | null = null;
+  let cleanSedeId: number | null = null;
+
+  if (cleanRole === 'ADMIN') {
+    const sede = getSedeById(Number(sede_id));
+    if (!sede) {
+      res.status(400).json({ error: 'Todo Administrador debe tener una sede asignada.' });
+      return;
+    }
+    cleanSedeId = sede.id;
+  } else if (cleanRole === 'CONDUCTOR') {
+    if (!vehicle_id) {
+      res.status(400).json({ error: 'Todo conductor debe tener un camión asignado.' });
+      return;
+    }
+    const veh = db.prepare('SELECT id, sede_id FROM vehicles WHERE id = ?').get(Number(vehicle_id)) as
+      | { id: number; sede_id: number | null }
+      | undefined;
+    if (!veh) {
+      res.status(400).json({ error: 'El camión seleccionado no existe.' });
+      return;
+    }
+    if (actor.role === 'ADMIN' && veh.sede_id !== actor.sede_id) {
+      res.status(403).json({ error: 'Solo puedes asignar camiones de tu propia sede.' });
+      return;
+    }
+    cleanVehicleId = veh.id;
+    cleanSedeId = actor.role === 'ADMIN' ? actor.sede_id : veh.sede_id;
+  } else {
+    // GERENCIA is global
+    cleanSedeId = null;
+    cleanVehicleId = null;
   }
 
   try {
     const hash = bcrypt.hashSync(cleanPass, 10);
     const info = db
       .prepare(
-        `INSERT INTO users (username, password_hash, full_name, role, vehicle_id, active, created_at)
-         VALUES (?, ?, ?, ?, ?, 1, ?)`
+        `INSERT INTO users (username, password_hash, full_name, role, sede_id, vehicle_id, active, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?)`
       )
-      .run(cleanUser, hash, cleanName, cleanRole, cleanVehicleId, new Date().toISOString());
+      .run(cleanUser, hash, cleanName, cleanRole, cleanSedeId, cleanVehicleId, new Date().toISOString());
 
     const created = getUserById(Number(info.lastInsertRowid));
-    logAudit(req.user!.id, 'USER_CREATE', `Usuario creado: ${cleanUser} (${cleanRole})`);
+    logAudit(actor.id, 'USER_CREATE', `Usuario creado: ${cleanUser} (${cleanRole})`);
     res.status(201).json({ user: created });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : '';
@@ -1133,10 +1785,19 @@ app.post('/api/admin/users', requireAuth, requireRole('GERENCIA'), (req: AuthedR
   }
 });
 
-app.put('/api/admin/users/:id', requireAuth, requireRole('GERENCIA'), (req: AuthedRequest, res: Response) => {
+app.put('/api/admin/users/:id', requireAuth, requireRole('GERENCIA', 'ADMIN'), (req: AuthedRequest, res: Response) => {
+  const actor = req.user!;
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM users WHERE id = ?').get(id) as
-    | { id: number; username: string; full_name: string; role: 'CONDUCTOR' | 'GERENCIA'; vehicle_id: number | null; active: number }
+    | {
+        id: number;
+        username: string;
+        full_name: string;
+        role: UserRole;
+        sede_id: number | null;
+        vehicle_id: number | null;
+        active: number;
+      }
     | undefined;
 
   if (!existing) {
@@ -1144,21 +1805,62 @@ app.put('/api/admin/users/:id', requireAuth, requireRole('GERENCIA'), (req: Auth
     return;
   }
 
-  const { full_name, role, vehicle_id, active, password } = req.body ?? {};
+  if (actor.role === 'ADMIN') {
+    if (existing.role !== 'CONDUCTOR' || existing.sede_id !== actor.sede_id) {
+      res.status(403).json({ error: 'Solo puedes editar conductores de tu propia sede.' });
+      return;
+    }
+  }
+
+  const { full_name, role, sede_id, vehicle_id, active, password } = req.body ?? {};
   const cleanName = typeof full_name === 'string' && full_name.trim() ? full_name.trim() : existing.full_name;
-  const cleanRole = role === 'GERENCIA' || role === 'CONDUCTOR' ? role : existing.role;
-  const cleanVehicleId =
-    cleanRole === 'CONDUCTOR'
-      ? vehicle_id !== undefined
-        ? vehicle_id
-          ? Number(vehicle_id)
-          : null
-        : existing.vehicle_id
-      : null;
+  const requestedRole: UserRole =
+    role === 'GERENCIA' || role === 'ADMIN' || role === 'CONDUCTOR' ? role : existing.role;
+
+  if (actor.role === 'ADMIN' && requestedRole !== 'CONDUCTOR') {
+    res.status(403).json({ error: 'No tienes permisos para cambiar el rol a Administrador o Gerencia.' });
+    return;
+  }
+
+  let cleanVehicleId: number | null = null;
+  let cleanSedeId: number | null = existing.sede_id;
+
+  if (requestedRole === 'CONDUCTOR') {
+    const targetVehId =
+      vehicle_id !== undefined ? (vehicle_id ? Number(vehicle_id) : null) : existing.vehicle_id;
+    if (targetVehId) {
+      const veh = db.prepare('SELECT id, sede_id FROM vehicles WHERE id = ?').get(targetVehId) as
+        | { id: number; sede_id: number | null }
+        | undefined;
+      if (!veh) {
+        res.status(400).json({ error: 'El camión seleccionado no existe.' });
+        return;
+      }
+      if (actor.role === 'ADMIN' && veh.sede_id !== actor.sede_id) {
+        res.status(403).json({ error: 'Solo puedes asignar camiones de tu propia sede.' });
+        return;
+      }
+      cleanVehicleId = veh.id;
+      cleanSedeId = actor.role === 'ADMIN' ? actor.sede_id : veh.sede_id;
+    }
+  } else if (requestedRole === 'ADMIN') {
+    const targetSedeId = sede_id !== undefined ? Number(sede_id) : existing.sede_id;
+    const sede = getSedeById(targetSedeId);
+    if (!sede) {
+      res.status(400).json({ error: 'Todo Administrador debe tener una sede asignada.' });
+      return;
+    }
+    cleanSedeId = sede.id;
+    cleanVehicleId = null;
+  } else {
+    cleanSedeId = null;
+    cleanVehicleId = null;
+  }
+
   const isActive = active !== undefined ? (active ? 1 : 0) : existing.active;
 
-  // Prevent disabling own Gerencia account accidentally
-  if (id === req.user!.id && isActive === 0) {
+  // Prevent disabling own account accidentally
+  if (id === actor.id && isActive === 0) {
     res.status(400).json({ error: 'No puedes desactivar tu propia cuenta en sesión.' });
     return;
   }
@@ -1173,11 +1875,11 @@ app.put('/api/admin/users/:id', requireAuth, requireRole('GERENCIA'), (req: Auth
   }
 
   db.prepare(
-    'UPDATE users SET full_name = ?, role = ?, vehicle_id = ?, active = ? WHERE id = ?'
-  ).run(cleanName, cleanRole, cleanVehicleId, isActive, id);
+    'UPDATE users SET full_name = ?, role = ?, sede_id = ?, vehicle_id = ?, active = ? WHERE id = ?'
+  ).run(cleanName, requestedRole, cleanSedeId, cleanVehicleId, isActive, id);
 
   const updated = getUserById(id);
-  logAudit(req.user!.id, 'USER_UPDATE', `Usuario actualizado: ${existing.username}`);
+  logAudit(actor.id, 'USER_UPDATE', `Usuario actualizado: ${existing.username}`);
   res.json({ user: updated });
 });
 
@@ -1185,7 +1887,7 @@ app.put('/api/admin/users/:id', requireAuth, requireRole('GERENCIA'), (req: Auth
 // REPORTS ENGINE
 // ==========================================
 
-app.get('/api/admin/reports', requireAuth, requireRole('GERENCIA'), (req: AuthedRequest, res: Response) => {
+app.get('/api/admin/reports', requireAuth, requireRole('GERENCIA', 'ADMIN'), (req: AuthedRequest, res: Response) => {
   const { eventDate: today } = getServerDateParts();
   const startDate =
     typeof req.query.startDate === 'string' && req.query.startDate.trim()
@@ -1195,12 +1897,17 @@ app.get('/api/admin/reports', requireAuth, requireRole('GERENCIA'), (req: Authed
     typeof req.query.endDate === 'string' && req.query.endDate.trim()
       ? req.query.endDate.trim()
       : today;
+  const scopedSedeId = resolveScopedSedeId(req.user!, req.query.sedeId);
   const vehicleId = req.query.vehicleId ? Number(req.query.vehicleId) : null;
   const userId = req.query.userId ? Number(req.query.userId) : null;
 
   const conditions = ['event_date >= ?', 'event_date <= ?'];
   const params: unknown[] = [startDate, endDate];
 
+  if (scopedSedeId) {
+    conditions.push('sede_id = ?');
+    params.push(scopedSedeId);
+  }
   if (vehicleId) {
     conditions.push('vehicle_id = ?');
     params.push(vehicleId);
@@ -1245,7 +1952,6 @@ app.get('/api/admin/reports', requireAuth, requireRole('GERENCIA'), (req: Authed
   const byDriverMap = new Map<string, AggRow>();
   const locationStays: LocationStay[] = [];
 
-  // Group chronologically per vehicle to compute exact shift hours & location stays
   const eventsByVehicle = new Map<string, EventRow[]>();
   for (const ev of events) {
     const vKey = `${ev.vehicle_code_snapshot}|${ev.vehicle_plate_snapshot}`;
@@ -1391,7 +2097,7 @@ app.get('/api/admin/reports', requireAuth, requireRole('GERENCIA'), (req: Authed
 });
 
 // ==========================================
-// BACKUP & RECOVERY
+// BACKUP & RECOVERY (GERENCIA ONLY)
 // ==========================================
 
 app.get('/api/admin/backup/export', requireAuth, requireRole('GERENCIA'), async (req: AuthedRequest, res: Response) => {
@@ -1413,14 +2119,17 @@ app.get('/api/admin/backup/export', requireAuth, requireRole('GERENCIA'), async 
   }
 
   const payload = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     exportedAt: new Date().toISOString(),
     exportedBy: req.user!.username,
     tables: {
+      sedes: db.prepare('SELECT * FROM sedes').all(),
       vehicles: db.prepare('SELECT * FROM vehicles').all(),
       users: db.prepare('SELECT * FROM users').all(),
       geofences: db.prepare('SELECT * FROM geofences').all(),
       events: db.prepare('SELECT * FROM events').all(),
+      route_points: db.prepare('SELECT * FROM route_points').all(),
+      planned_routes: db.prepare('SELECT * FROM planned_routes').all(),
       driver_geofence_state: db.prepare('SELECT * FROM driver_geofence_state').all(),
     },
   };
@@ -1458,8 +2167,8 @@ app.post('/api/admin/backup/restore', requireAuth, requireRole('GERENCIA'), (req
 
   const tx = db.transaction(() => {
     const insertVehicle = db.prepare(
-      `INSERT OR IGNORE INTO vehicles (code, plate, brand, model, capacity_tons, active, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT OR IGNORE INTO vehicles (code, plate, brand, model, capacity_tons, sede_id, active, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     );
     for (const v of vehicles) {
       if (typeof v.code === 'string' && typeof v.plate === 'string') {
@@ -1469,6 +2178,7 @@ app.post('/api/admin/backup/restore', requireAuth, requireRole('GERENCIA'), (req
           String(v.brand ?? ''),
           String(v.model ?? ''),
           Number(v.capacity_tons ?? 0),
+          v.sede_id ? Number(v.sede_id) : null,
           Number(v.active ?? 1),
           String(v.created_at ?? new Date().toISOString())
         );
@@ -1477,8 +2187,8 @@ app.post('/api/admin/backup/restore', requireAuth, requireRole('GERENCIA'), (req
     }
 
     const insertGf = db.prepare(
-      `INSERT OR IGNORE INTO geofences (id, name, category, latitude, longitude, radius_meters, active, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT OR IGNORE INTO geofences (id, name, category, latitude, longitude, radius_meters, sede_id, active, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     for (const g of geofences) {
       if (typeof g.name === 'string' && Number.isFinite(Number(g.latitude)) && Number.isFinite(Number(g.longitude))) {
@@ -1489,6 +2199,7 @@ app.post('/api/admin/backup/restore', requireAuth, requireRole('GERENCIA'), (req
           Number(g.latitude),
           Number(g.longitude),
           Number(g.radius_meters) || 150,
+          g.sede_id ? Number(g.sede_id) : null,
           Number(g.active ?? 1),
           String(g.created_at ?? new Date().toISOString()),
           String(g.updated_at ?? new Date().toISOString())
@@ -1503,9 +2214,10 @@ app.post('/api/admin/backup/restore', requireAuth, requireRole('GERENCIA'), (req
         latitude, longitude, accuracy_meters, address,
         user_id, username_snapshot, driver_name_snapshot,
         vehicle_id, vehicle_code_snapshot, vehicle_plate_snapshot,
+        sede_id, sede_name_snapshot,
         event_type, source, geofence_id, geofence_name_snapshot,
         notes, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     for (const e of events) {
       if (typeof e.event_uuid === 'string' && typeof e.event_date === 'string' && typeof e.event_type === 'string') {
@@ -1524,6 +2236,8 @@ app.post('/api/admin/backup/restore', requireAuth, requireRole('GERENCIA'), (req
           null,
           String(e.vehicle_code_snapshot ?? ''),
           String(e.vehicle_plate_snapshot ?? ''),
+          e.sede_id ? Number(e.sede_id) : null,
+          String(e.sede_name_snapshot ?? ''),
           VALID_EVENT_TYPES.includes(e.event_type as (typeof VALID_EVENT_TYPES)[number]) ? e.event_type : 'ENTRADA',
           e.source === 'GEOCERCA_AUTO' ? 'GEOCERCA_AUTO' : 'MANUAL',
           e.geofence_id ? Number(e.geofence_id) : null,

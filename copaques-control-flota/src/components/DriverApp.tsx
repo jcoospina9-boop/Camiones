@@ -51,6 +51,7 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [confirmFinish, setConfirmFinish] = useState(false);
   const [elapsedText, setElapsedText] = useState('00:00:00');
+  const [logoError, setLogoError] = useState(false);
 
   const loadStatus = useCallback(async () => {
     try {
@@ -127,13 +128,13 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
     return () => clearInterval(timer);
   }, [status?.shiftActive, status?.shiftStartedAt]);
 
-  // Automatic background geofence detection while on shift
+  // Automatic background GPS route tracking & geofence detection while on shift
   useEffect(() => {
-    if (!status?.shiftActive || !status.hasVehicle || status.activeGeofencesCount === 0) {
+    if (!status?.shiftActive || !status.hasVehicle) {
       return;
     }
 
-    const runGeofenceCheck = async () => {
+    const runGpsAndGeofenceCheck = async () => {
       try {
         const pos = await readCurrentGps();
         const res = await apiFetch<{
@@ -144,6 +145,7 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
           body: JSON.stringify({
             latitude: pos.latitude,
             longitude: pos.longitude,
+            accuracy_meters: pos.accuracy,
           }),
         });
         if (res.triggeredEvents.length > 0) {
@@ -159,9 +161,9 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
       }
     };
 
-    const interval = setInterval(runGeofenceCheck, 30000);
+    const interval = setInterval(runGpsAndGeofenceCheck, 25000);
     return () => clearInterval(interval);
-  }, [status?.shiftActive, status?.hasVehicle, status?.activeGeofencesCount, readCurrentGps, loadStatus]);
+  }, [status?.shiftActive, status?.hasVehicle, readCurrentGps, loadStatus]);
 
   async function registerEvent(eventType: EventType) {
     setFeedback(null);
@@ -196,25 +198,38 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
   }
 
   return (
-    <div className="min-h-screen bg-slate-100 text-slate-900 pb-10">
+    <div className="min-h-screen bg-[#f6f9f6] text-slate-900 pb-10">
       {/* Compact Sticky Top Bar */}
-      <header className="sticky top-0 z-30 h-14 bg-emerald-950 text-white px-4 flex items-center justify-between gap-4 border-b border-emerald-900">
-        <div className="flex items-center gap-2.5 min-w-0">
-          <div className="w-8 h-8 rounded-lg bg-yellow-400 text-emerald-950 flex items-center justify-center shrink-0">
-            <Truck className="w-4 h-4" />
-          </div>
-          <div className="min-w-0">
-            <p className="text-sm font-bold truncate leading-tight">
-              {user.vehicle_code ? `Copaques · ${user.vehicle_code} (${user.vehicle_plate})` : 'Copaques · Sin vehículo'}
+      <header className="sticky top-0 z-30 h-14 bg-white text-slate-900 px-4 flex items-center justify-between gap-3 border-b-2 border-[#0e7a2d]">
+        <div className="flex items-center gap-3 min-w-0">
+          {!logoError ? (
+            <img
+              src="/assets/aistudio/image_2fcce064.png"
+              alt="Copaques"
+              referrerPolicy="no-referrer"
+              onError={() => setLogoError(true)}
+              className="h-9 w-auto object-contain shrink-0 rounded"
+            />
+          ) : (
+            <div className="w-8 h-8 rounded-lg bg-[#0e7a2d] text-white flex items-center justify-center shrink-0">
+              <Truck className="w-4 h-4" />
+            </div>
+          )}
+          <div className="min-w-0 border-l border-slate-200 pl-3">
+            <p className="text-sm font-bold truncate leading-tight text-[#181a18]">
+              {user.vehicle_code ? `${user.vehicle_code} (${user.vehicle_plate})` : 'Sin vehículo'}
             </p>
-            <p className="text-xs text-emerald-200 truncate leading-tight">{user.full_name}</p>
+            <p className="text-xs text-slate-600 truncate leading-tight">
+              {user.full_name}
+              {user.sede_name ? ` · Sede ${user.sede_name}` : ''}
+            </p>
           </div>
         </div>
 
         <button
           type="button"
           onClick={onLogout}
-          className="min-h-[44px] px-3 rounded-lg bg-emerald-900 hover:bg-emerald-800 text-white text-xs font-medium flex items-center gap-1.5 shrink-0 cursor-pointer"
+          className="min-h-[40px] px-3 rounded-lg bg-[#0e7a2d] hover:bg-[#0b6123] text-white text-xs font-semibold flex items-center gap-1.5 shrink-0 cursor-pointer"
         >
           <LogOut className="w-4 h-4" />
           <span>Salir</span>
