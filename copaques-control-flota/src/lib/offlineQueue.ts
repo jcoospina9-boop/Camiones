@@ -1,8 +1,11 @@
-import type { EventType } from '../types.ts';
+import type { DriverAvailableVehicle, EventType } from '../types.ts';
 
 export interface PendingDriverEvent {
   event_uuid: string;
   event_type: EventType;
+  vehicle_id?: number | null;
+  vehicle_code?: string;
+  vehicle_plate?: string;
   latitude: number;
   longitude: number;
   accuracy_meters: number | null;
@@ -32,10 +35,33 @@ export interface SyncOfflineResponse {
 }
 
 const STORAGE_PREFIX = 'copaques_offline_queue_v1_';
+const VEHICLES_CACHE_PREFIX = 'copaques_driver_vehicles_v1_';
 const MAX_OFFLINE_POINTS = 500;
 
 function getStorageKey(userId: number): string {
   return `${STORAGE_PREFIX}${userId}`;
+}
+
+export function saveCachedAvailableVehicles(
+  userId: number,
+  vehicles: DriverAvailableVehicle[]
+): void {
+  try {
+    localStorage.setItem(`${VEHICLES_CACHE_PREFIX}${userId}`, JSON.stringify(vehicles));
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+export function loadCachedAvailableVehicles(userId: number): DriverAvailableVehicle[] {
+  try {
+    const raw = localStorage.getItem(`${VEHICLES_CACHE_PREFIX}${userId}`);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as DriverAvailableVehicle[]) : [];
+  } catch {
+    return [];
+  }
 }
 
 function haversineMetersClient(lat1: number, lon1: number, lat2: number, lon2: number): number {

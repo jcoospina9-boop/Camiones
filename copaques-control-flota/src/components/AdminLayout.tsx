@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
+  AlertTriangle,
   BookOpen,
   Building2,
   ChevronLeft,
@@ -19,6 +20,7 @@ import { apiFetch } from '../lib/api.ts';
 import {
   formatEventLabel,
   formatRoleLabel,
+  getDocExpiryStatus,
   type DashboardResponse,
   type FleetEvent,
   type Sede,
@@ -178,6 +180,19 @@ export function AdminLayout({ user, onLogout }: AdminLayoutProps) {
     sedes.find((s) => s.id === selectedSedeId)?.name || user.sede_name || 'Todas las sedes';
 
   const fleetList = dashboard?.fleetStatus ?? [];
+  const docAlerts = fleetList
+    .map((v) => ({
+      vehicle: v,
+      soat: getDocExpiryStatus(v.soat_expires_at),
+      tecno: getDocExpiryStatus(v.tecnomecanica_expires_at),
+    }))
+    .filter(
+      (item) =>
+        item.soat.status === 'expired' ||
+        item.soat.status === 'soon' ||
+        item.tecno.status === 'expired' ||
+        item.tecno.status === 'soon'
+    );
   const totalDashPages = Math.max(1, Math.ceil(fleetList.length / DASH_TRUCK_PAGE_SIZE));
   const safeDashPage = Math.min(dashTruckPage, totalDashPages);
   const pagedFleet = fleetList.slice(
@@ -413,6 +428,60 @@ export function AdminLayout({ user, onLogout }: AdminLayoutProps) {
                     </section>
                   )}
 
+                  {/* Compact SOAT & Tecnomecánica Alerts Banner */}
+                  {docAlerts.length > 0 && (
+                    <section className="bg-red-50 border border-red-200 rounded-xl p-4 space-y-2.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2 text-red-900">
+                          <AlertTriangle className="w-4 h-4 text-red-700 shrink-0" />
+                          <h2 className="text-sm font-bold">
+                            Alertas de SOAT y Tecnomecánica ({docAlerts.length})
+                          </h2>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setSection('fleet')}
+                          className="text-xs font-semibold text-red-800 hover:underline cursor-pointer"
+                        >
+                          Ver en Flota
+                        </button>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {docAlerts.map(({ vehicle, soat, tecno }) => (
+                          <div
+                            key={vehicle.id}
+                            className="bg-white border border-red-200 rounded-lg px-3 py-1.5 text-xs flex flex-wrap items-center gap-2"
+                          >
+                            <span className="font-bold font-mono text-slate-900">
+                              {vehicle.code} · {vehicle.plate}
+                            </span>
+                            {isGerencia && !selectedSedeId && vehicle.sede_name && (
+                              <span className="text-slate-500">({vehicle.sede_name})</span>
+                            )}
+                            {(soat.status === 'expired' || soat.status === 'soon') && (
+                              <span
+                                className={`font-semibold ${
+                                  soat.status === 'expired' ? 'text-red-700' : 'text-amber-700'
+                                }`}
+                              >
+                                SOAT: {soat.label}
+                              </span>
+                            )}
+                            {(tecno.status === 'expired' || tecno.status === 'soon') && (
+                              <span
+                                className={`font-semibold ${
+                                  tecno.status === 'expired' ? 'text-red-700' : 'text-amber-700'
+                                }`}
+                              >
+                                Tecno: {tecno.label}
+                              </span>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                  )}
+
                   {/* Empty Onboarding Banner when no trucks exist */}
                   {dashboard.fleetStatus.length === 0 && (
                     <div className="bg-white border border-slate-200 rounded-xl p-6 flex flex-wrap items-center justify-between gap-4">
@@ -484,7 +553,7 @@ export function AdminLayout({ user, onLogout }: AdminLayoutProps) {
                                   )}
                                   <td className="py-2.5 px-4 text-slate-700">
                                     {v.driver_name || (
-                                      <span className="text-xs text-slate-400">Sin asignar</span>
+                                      <span className="text-xs text-slate-400">Disponible (sin turno)</span>
                                     )}
                                   </td>
                                   <td className="py-2.5 px-4 whitespace-nowrap">
@@ -583,7 +652,8 @@ export function AdminLayout({ user, onLogout }: AdminLayoutProps) {
                               </div>
                               <p className="mt-1 text-xs text-slate-600 truncate">
                                 {ev.driver_name_snapshot}
-                                {ev.sede_name_snapshot ? ` (${ev.sede_name_snapshot})` : ''} ·{' '}
+                                {ev.driver_code_snapshot ? ` (${ev.driver_code_snapshot})` : ''}
+                                {ev.sede_name_snapshot ? ` · ${ev.sede_name_snapshot}` : ''} ·{' '}
                                 {ev.address}
                               </p>
                             </div>
@@ -735,6 +805,11 @@ export function AdminLayout({ user, onLogout }: AdminLayoutProps) {
                             </td>
                             <td className="py-2.5 px-4 text-slate-700 whitespace-nowrap">
                               {ev.driver_name_snapshot}
+                              {ev.driver_code_snapshot && (
+                                <span className="ml-1.5 text-xs font-mono text-slate-400">
+                                  ({ev.driver_code_snapshot})
+                                </span>
+                              )}
                             </td>
                             <td className="py-2.5 px-4 whitespace-nowrap">
                               <span

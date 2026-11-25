@@ -15,14 +15,16 @@ import {
   UploadCloud,
   Wifi,
 } from 'lucide-react';
-import { ApiError, apiFetch } from '../lib/api.ts';
+import { ApiError, apiFetch, setAuthToken } from '../lib/api.ts';
 import {
   enqueueOfflineEvent,
   enqueueOfflineGpsPoint,
   generateClientUuid,
   getColombiaDateParts,
+  loadCachedAvailableVehicles,
   loadOfflineQueue,
   removeSyncedItems,
+  saveCachedAvailableVehicles,
   type OfflineDriverQueue,
   type PendingDriverEvent,
   type SyncOfflineResponse,
@@ -30,6 +32,7 @@ import {
 import {
   formatEventLabel,
   getColombiaToday,
+  type DriverAvailableVehicle,
   type DriverStatusResponse,
   type EventType,
   type FleetEvent,
@@ -82,6 +85,12 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
   const [pendingQueue, setPendingQueue] = useState<OfflineDriverQueue>(() =>
     loadOfflineQueue(user.id)
   );
+  const [cachedVehicles, setCachedVehicles] = useState<DriverAvailableVehicle[]>(() =>
+    loadCachedAvailableVehicles(user.id)
+  );
+  const [selectedVehicleId, setSelectedVehicleId] = useState<number | null>(
+    user.vehicle_id ?? null
+  );
   const [notes, setNotes] = useState('');
   const [gps, setGps] = useState<GpsReading | null>(null);
   const [gpsError, setGpsError] = useState<string | null>(null);
@@ -93,15 +102,19 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
   const [logoError, setLogoError] = useState(false);
 
   const syncingRef = useRef(false);
+  const lastRefreshRef = useRef<number>(Date.now());
 
   useEffect(() => {
     setPendingQueue(loadOfflineQueue(user.id));
+    setCachedVehicles(loadCachedAvailableVehicles(user.id));
   }, [user.id]);
 
   const loadStatus = useCallback(async () => {
     try {
       const data = await apiFetch<DriverStatusResponse>('/api/driver/status');
       setStatus(data);
+      saveCachedAvailableVehicles(user.id, data.availableVehicles);
+      setCachedVehicles(data.availableVehicles);
     } catch (err) {
       if (err instanceof ApiError) {
         setFeedback({ type: 'err', text: err.message });
@@ -110,6 +123,23 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
       }
     } finally {
       setLoading(false);
+    }
+  }, [user.id]);
+
+  const keepSessionAlive = useCallback(async (force = false) => {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+    const now = Date.now();
+    if (!force && now - lastRefreshRef.current < 30 * 60 * 1000) return;
+    try {
+      const res = await apiFetch<{ user: User; token?: string }>('/api/auth/refresh', {
+        method: 'POST',
+      });
+      if (res.token) {
+        setAuthToken(res.token);
+      }
+      lastRefreshRef.current = now;
+    } catch {
+      // Ignore transient offline errors; cookie lasts 180 days
     }
   }, []);
 
@@ -195,18 +225,31 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
   useEffect(() => {
     const handleOnline = () => {
       setIsOnline(true);
+      keepSessionAlive(true);
       syncOfflineQueue(false);
     };
     const handleOffline = () => {
       setIsOnline(false);
     };
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        keepSessionAlive(false);
+      }
+    };
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
+    document.addEventListener('visibilitychange', handleVisibility);
+    const keepAliveTimer = setInterval(() => {
+      keepSessionAlive(true);
+    }, 6 * 60 * 60 * 1000);
+
     return () => {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      clearInterval(keepAliveTimer);
     };
-  }, [syncOfflineQueue]);
+  }, [syncOfflineQueue, keepSessionAlive]);
 
   const readCurrentGps = useCallback((): Promise<GpsReading> => {
     return new Promise((resolve, reject) => {
@@ -260,10 +303,36 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
     return () => clearInterval(timer);
   }, [pendingQueue.events.length, pendingQueue.gpsPoints.length, isOnline, syncOfflineQueue]);
 
+  const availableVehiclesList = useMemo(
+    () => status?.availableVehicles ?? cachedVehicles,
+    [status?.availableVehicles, cachedVehicles]
+  );
+
+  // Pick a sensible default idle vehicle when off-shift
+  useEffect(() => {
+    if (availableVehiclesList.length === 0) return;
+    const isSelectable = (v: DriverAvailableVehicle) =>
+      !v.inUseByDriverName || v.inUseByUserId === user.id;
+
+    const currentValid = availableVehiclesList.find(
+      (v) => v.id === selectedVehicleId && isSelectable(v)
+    );
+    if (currentValid) return;
+
+    const defaultPref =
+      availableVehiclesList.find((v) => v.id === user.vehicle_id && isSelectable(v)) ??
+      availableVehiclesList.find(isSelectable) ??
+      null;
+    setSelectedVehicleId(defaultPref ? defaultPref.id : null);
+  }, [availableVehiclesList, selectedVehicleId, user.id, user.vehicle_id]);
+
   // Combine server shift state with locally queued offline events
   const effectiveShift = useMemo(() => {
     let active = status?.shiftActive ?? false;
     let startedAt = status?.shiftStartedAt ?? null;
+    let vehicleId: number | null = status?.activeVehicle?.id ?? null;
+    let vehicleCode: string | null = status?.activeVehicle?.code ?? null;
+    let vehiclePlate: string | null = status?.activeVehicle?.plate ?? null;
     const serverLatestRecordedAt = status?.todayEvents?.[0]?.recorded_at ?? '';
 
     const sortedPending = [...pendingQueue.events].sort(
@@ -277,14 +346,32 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
       if (ev.event_type === 'INICIO_JORNADA') {
         active = true;
         startedAt = ev.recorded_at;
+        vehicleId = ev.vehicle_id ?? vehicleId;
+        vehicleCode = ev.vehicle_code ?? vehicleCode;
+        vehiclePlate = ev.vehicle_plate ?? vehiclePlate;
       } else if (ev.event_type === 'FIN_JORNADA') {
         active = false;
         startedAt = null;
+        vehicleId = null;
+        vehicleCode = null;
+        vehiclePlate = null;
       }
     }
 
-    return { shiftActive: active, shiftStartedAt: startedAt };
-  }, [status?.shiftActive, status?.shiftStartedAt, status?.todayEvents, pendingQueue.events]);
+    return {
+      shiftActive: active,
+      shiftStartedAt: startedAt,
+      vehicleId,
+      vehicleCode,
+      vehiclePlate,
+    };
+  }, [
+    status?.shiftActive,
+    status?.shiftStartedAt,
+    status?.activeVehicle,
+    status?.todayEvents,
+    pendingQueue.events,
+  ]);
 
   // Merge pending offline events with server events for today's history
   const mergedTodayEvents = useMemo<DisplayDriverEvent[]>(() => {
@@ -362,8 +449,8 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
 
   // Automatic background GPS route tracking & geofence detection while on shift (works offline too)
   useEffect(() => {
-    const hasVehicle = status?.hasVehicle ?? Boolean(user.vehicle_id);
-    if (!effectiveShift.shiftActive || !hasVehicle) {
+    const hasShiftVehicle = Boolean(effectiveShift.vehicleId || status?.hasVehicle || user.vehicle_id);
+    if (!effectiveShift.shiftActive || !hasShiftVehicle) {
       return;
     }
 
@@ -421,10 +508,11 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
       }
     };
 
-    const interval = setInterval(runGpsAndGeofenceCheck, 25000);
+    const interval = setInterval(runGpsAndGeofenceCheck, 15000);
     return () => clearInterval(interval);
   }, [
     effectiveShift.shiftActive,
+    effectiveShift.vehicleId,
     status?.hasVehicle,
     user.id,
     user.vehicle_id,
@@ -436,13 +524,17 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
     eventType: EventType,
     reading: GpsReading,
     eventUuid: string,
-    cleanNotes: string
+    cleanNotes: string,
+    chosenVehicle?: DriverAvailableVehicle | null
   ) {
     const now = new Date();
     const { eventDate, eventTime, recordedAt } = getColombiaDateParts(now);
     const pendingEv: PendingDriverEvent = {
       event_uuid: eventUuid,
       event_type: eventType,
+      vehicle_id: chosenVehicle?.id ?? effectiveShift.vehicleId ?? user.vehicle_id ?? null,
+      vehicle_code: chosenVehicle?.code ?? effectiveShift.vehicleCode ?? undefined,
+      vehicle_plate: chosenVehicle?.plate ?? effectiveShift.vehiclePlate ?? undefined,
       latitude: reading.latitude,
       longitude: reading.longitude,
       accuracy_meters: reading.accuracy,
@@ -463,6 +555,27 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
 
   async function registerEvent(eventType: EventType) {
     setFeedback(null);
+
+    let chosenVehicle: DriverAvailableVehicle | null = null;
+    if (eventType === 'INICIO_JORNADA') {
+      chosenVehicle =
+        availableVehiclesList.find((v) => v.id === selectedVehicleId) ?? null;
+      if (!chosenVehicle) {
+        setFeedback({
+          type: 'err',
+          text: 'Selecciona primero el camión en el que trabajarás hoy.',
+        });
+        return;
+      }
+      if (chosenVehicle.inUseByDriverName && chosenVehicle.inUseByUserId !== user.id) {
+        setFeedback({
+          type: 'err',
+          text: `El camión ${chosenVehicle.code} ya está en jornada con ${chosenVehicle.inUseByDriverName}.`,
+        });
+        return;
+      }
+    }
+
     setSubmitting(true);
     const eventUuid = generateClientUuid();
     const cleanNotes = notes.trim();
@@ -481,7 +594,7 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
 
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       setIsOnline(false);
-      saveEventLocally(eventType, reading, eventUuid, cleanNotes);
+      saveEventLocally(eventType, reading, eventUuid, cleanNotes, chosenVehicle);
       setSubmitting(false);
       return;
     }
@@ -492,6 +605,7 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
         body: JSON.stringify({
           event_uuid: eventUuid,
           event_type: eventType,
+          vehicle_id: chosenVehicle ? chosenVehicle.id : undefined,
           latitude: reading.latitude,
           longitude: reading.longitude,
           accuracy_meters: reading.accuracy,
@@ -514,14 +628,22 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
       } else {
         // Network failure in dead zone: queue locally instead of losing the event
         setIsOnline(false);
-        saveEventLocally(eventType, reading, eventUuid, cleanNotes);
+        saveEventLocally(eventType, reading, eventUuid, cleanNotes, chosenVehicle);
       }
     } finally {
       setSubmitting(false);
     }
   }
 
-  const hasVehicle = status ? status.hasVehicle : Boolean(user.vehicle_id);
+  const hasAvailableVehicles =
+    availableVehiclesList.length > 0 || Boolean(effectiveShift.vehicleId) || Boolean(status?.hasVehicle);
+  const selectedVehicleObj =
+    availableVehiclesList.find((v) => v.id === selectedVehicleId) ?? null;
+  const headerVehicleText = effectiveShift.shiftActive && effectiveShift.vehicleCode
+    ? `${effectiveShift.vehicleCode} (${effectiveShift.vehiclePlate})`
+    : selectedVehicleObj
+      ? `${selectedVehicleObj.code} (${selectedVehicleObj.plate})`
+      : 'Elige camión al iniciar';
   const pendingCount = pendingQueue.events.length + pendingQueue.gpsPoints.length;
 
   return (
@@ -544,11 +666,12 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
           )}
           <div className="min-w-0 border-l border-slate-200 pl-3">
             <p className="text-sm font-bold truncate leading-tight text-[#181a18]">
-              {user.vehicle_code ? `${user.vehicle_code} (${user.vehicle_plate})` : 'Sin vehículo'}
+              {headerVehicleText}
             </p>
             <p className="text-xs text-slate-600 truncate leading-tight">
               {user.full_name}
-              {user.sede_name ? ` · Sede ${user.sede_name}` : ''}
+              {user.driver_code ? ` · Cód. ${user.driver_code}` : ''}
+              {user.sede_name ? ` · ${user.sede_name}` : ''}
             </p>
           </div>
         </div>
@@ -568,11 +691,11 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
           <div className="bg-white border border-slate-200 rounded-2xl p-8 text-center text-slate-500">
             Cargando estado del camión...
           </div>
-        ) : !hasVehicle ? (
+        ) : !hasAvailableVehicles ? (
           <div className="bg-yellow-50 border border-yellow-300 rounded-2xl p-6 text-emerald-950">
-            <h2 className="text-lg font-bold">Camión no asignado</h2>
+            <h2 className="text-lg font-bold">No hay camiones disponibles en tu sede</h2>
             <p className="mt-1 text-sm">
-              Tu usuario no tiene un camión vinculado actualmente. Solicita al Administrador de tu sede o a Gerencia que te asigne un vehículo.
+              Tu sede aún no tiene camiones activos registrados. Solicita a Gerencia o al Administrador de tu sede que agregue o traslade un vehículo.
             </p>
           </div>
         ) : (
@@ -723,12 +846,56 @@ export function DriverApp({ user, onLogout }: DriverAppProps) {
             <section className="bg-white border border-slate-200 rounded-2xl p-5 space-y-4">
               {!effectiveShift.shiftActive ? (
                 <div className="space-y-4">
+                  <div>
+                    <label className="block text-sm font-bold text-slate-900 mb-2">
+                      1. Selecciona el camión que vas a conducir hoy
+                    </label>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      {availableVehiclesList.map((v) => {
+                        const occupied =
+                          Boolean(v.inUseByDriverName) && v.inUseByUserId !== user.id;
+                        const isSelected = selectedVehicleId === v.id;
+                        return (
+                          <button
+                            key={v.id}
+                            type="button"
+                            disabled={occupied}
+                            onClick={() => setSelectedVehicleId(v.id)}
+                            className={`text-left p-3.5 rounded-xl border-2 transition-all flex items-center justify-between gap-2 ${
+                              occupied
+                                ? 'bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed'
+                                : isSelected
+                                  ? 'bg-emerald-50 border-[#0e7a2d] text-emerald-950 cursor-pointer'
+                                  : 'bg-white border-slate-200 hover:border-emerald-400 text-slate-800 cursor-pointer'
+                            }`}
+                          >
+                            <div className="min-w-0">
+                              <p className="text-sm font-bold font-mono">
+                                {v.code} · {v.plate}
+                              </p>
+                              <p className="text-xs text-slate-500 truncate">
+                                {occupied
+                                  ? `En turno con ${v.inUseByDriverName}`
+                                  : [v.brand, v.model].filter(Boolean).join(' ') || 'Disponible'}
+                              </p>
+                            </div>
+                            <Truck
+                              className={`w-5 h-5 shrink-0 ${
+                                isSelected && !occupied ? 'text-[#0e7a2d]' : 'text-slate-400'
+                              }`}
+                            />
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
                   <p className="text-sm text-slate-600">
-                    Presiona el botón para comenzar tu día laboral. La fecha, hora y ubicación GPS se guardarán automáticamente{!isOnline ? ' (modo sin señal)' : ''}.
+                    Presiona el botón para comenzar tu jornada con el camión elegido. La fecha, hora y ubicación GPS se guardarán automáticamente{!isOnline ? ' (modo sin señal)' : ''}.
                   </p>
                   <button
                     type="button"
-                    disabled={submitting}
+                    disabled={submitting || !selectedVehicleId}
                     onClick={() => registerEvent('INICIO_JORNADA')}
                     className="w-full min-h-[76px] rounded-2xl bg-emerald-800 hover:bg-emerald-900 active:scale-[0.99] text-white text-xl font-bold flex items-center justify-center gap-3 transition-transform disabled:opacity-60 cursor-pointer"
                   >

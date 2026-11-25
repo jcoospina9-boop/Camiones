@@ -35,6 +35,7 @@ export interface User {
   id: number;
   username: string;
   full_name: string;
+  driver_code?: string | null;
   role: UserRole;
   sede_id: number | null;
   sede_name?: string | null;
@@ -54,6 +55,8 @@ export interface Vehicle {
   capacity_tons: number;
   sede_id: number | null;
   sede_name?: string;
+  soat_expires_at?: string;
+  tecnomecanica_expires_at?: string;
   active: number;
   created_at: string;
   assigned_user_id?: number | null;
@@ -74,6 +77,7 @@ export interface FleetEvent {
   user_id: number;
   username_snapshot: string;
   driver_name_snapshot: string;
+  driver_code_snapshot?: string;
   vehicle_id: number | null;
   vehicle_code_snapshot: string;
   vehicle_plate_snapshot: string;
@@ -133,10 +137,30 @@ export interface Geofence {
   updated_at: string;
 }
 
+export interface DriverAvailableVehicle {
+  id: number;
+  code: string;
+  plate: string;
+  brand: string;
+  model: string;
+  sede_id: number | null;
+  sede_name?: string;
+  inUseByDriverName: string | null;
+  inUseByUserId: number | null;
+}
+
 export interface DriverStatusResponse {
   hasVehicle: boolean;
   shiftActive: boolean;
   shiftStartedAt: string | null;
+  activeVehicle: {
+    id: number;
+    code: string;
+    plate: string;
+    sede_id: number | null;
+    sede_name?: string;
+  } | null;
+  availableVehicles: DriverAvailableVehicle[];
   currentGeofence: {
     id: number;
     name: string;
@@ -156,6 +180,8 @@ export interface FleetVehicleStatus {
   capacity_tons: number;
   sede_id: number | null;
   sede_name?: string;
+  soat_expires_at?: string;
+  tecnomecanica_expires_at?: string;
   active: number;
   driver_id: number | null;
   driver_name: string | null;
@@ -292,4 +318,48 @@ export function getColombiaToday(): string {
     if (p.type !== 'literal') map[p.type] = p.value;
   }
   return `${map.year}-${map.month}-${map.day}`;
+}
+
+export function getDocExpiryStatus(dateStr?: string): {
+  status: 'none' | 'expired' | 'soon' | 'ok';
+  daysLeft: number | null;
+  label: string;
+} {
+  const clean = typeof dateStr === 'string' ? dateStr.trim() : '';
+  if (!clean) {
+    return { status: 'none', daysLeft: null, label: 'Sin fecha' };
+  }
+  const today = getColombiaToday();
+  const todayMs = Date.parse(`${today}T00:00:00Z`);
+  const expMs = Date.parse(`${clean}T00:00:00Z`);
+  if (!Number.isFinite(expMs)) {
+    return { status: 'none', daysLeft: null, label: 'Sin fecha' };
+  }
+  const daysLeft = Math.round((expMs - todayMs) / 86400000);
+  if (daysLeft < 0) {
+    return {
+      status: 'expired',
+      daysLeft,
+      label: `Vencido (${clean})`,
+    };
+  }
+  if (daysLeft === 0) {
+    return {
+      status: 'expired',
+      daysLeft: 0,
+      label: `Vence hoy (${clean})`,
+    };
+  }
+  if (daysLeft <= 15) {
+    return {
+      status: 'soon',
+      daysLeft,
+      label: `Vence en ${daysLeft}d (${clean})`,
+    };
+  }
+  return {
+    status: 'ok',
+    daysLeft,
+    label: clean,
+  };
 }

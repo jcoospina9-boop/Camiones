@@ -372,20 +372,44 @@ export function RouteMapView({
       opacity: 0.85,
     }).addTo(group);
 
-    // Numbered markers for all events
+    // Numbered markers for all events (with highlighted rings & tooltips for geofence Entrada/Salida)
     routeData.events.forEach((ev, idx) => {
       const bg = markerColor(ev.event_type);
+      const isGeofenceTransition =
+        (ev.event_type === 'ENTRADA' || ev.event_type === 'SALIDA') &&
+        (ev.source === 'GEOCERCA_AUTO' || Boolean(ev.geofence_name_snapshot));
+      const ringStyle = isGeofenceTransition
+        ? ev.event_type === 'ENTRADA'
+          ? '0 0 0 3px #bbf7d0, 0 2px 6px rgba(0,0,0,0.4)'
+          : '0 0 0 3px #fef08a, 0 2px 6px rgba(0,0,0,0.4)'
+        : '0 2px 6px rgba(0,0,0,0.35)';
+      const badgeLabel =
+        ev.event_type === 'ENTRADA' && isGeofenceTransition
+          ? `${idx + 1}E`
+          : ev.event_type === 'SALIDA' && isGeofenceTransition
+            ? `${idx + 1}S`
+            : `${idx + 1}`;
+      const size = isGeofenceTransition ? 32 : 28;
+      const half = size / 2;
+
       const icon = L.divIcon({
         className: 'custom-route-pin',
-        html: `<div style="width:28px;height:28px;border-radius:9999px;background:${bg};color:#ffffff;border:2px solid #ffffff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px;box-shadow:0 2px 6px rgba(0,0,0,0.35);">${idx + 1}</div>`,
-        iconSize: [28, 28],
-        iconAnchor: [14, 14],
+        html: `<div style="width:${size}px;height:${size}px;border-radius:9999px;background:${bg};color:${ev.event_type === 'SALIDA' ? '#052e16' : '#ffffff'};border:2px solid #ffffff;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:11px;box-shadow:${ringStyle};">${badgeLabel}</div>`,
+        iconSize: [size, size],
+        iconAnchor: [half, half],
       });
 
       const marker = L.marker([ev.latitude, ev.longitude], {
         icon,
-        zIndexOffset: 500 + idx,
+        zIndexOffset: (isGeofenceTransition ? 700 : 500) + idx,
       });
+
+      const tooltipEl = document.createElement('span');
+      tooltipEl.className = 'text-xs font-semibold';
+      tooltipEl.textContent = ev.geofence_name_snapshot
+        ? `#${idx + 1} ${formatEventLabel(ev.event_type)} · ${ev.geofence_name_snapshot} (${ev.event_time})`
+        : `#${idx + 1} ${formatEventLabel(ev.event_type)} (${ev.event_time})`;
+      marker.bindTooltip(tooltipEl, { direction: 'top', offset: [0, -10] });
 
       const container = document.createElement('div');
       container.className = 'text-sm space-y-1 min-w-[210px]';
@@ -1002,8 +1026,17 @@ export function RouteMapView({
                           {ev.event_time}
                         </span>
                       </div>
+                      {ev.geofence_name_snapshot && (
+                        <p
+                          className={`mt-1 text-[11px] font-semibold ${
+                            ev.event_type === 'SALIDA' ? 'text-amber-700' : 'text-emerald-700'
+                          }`}
+                        >
+                          Geocerca: {ev.geofence_name_snapshot}
+                          {ev.source === 'GEOCERCA_AUTO' ? ' (automático)' : ''}
+                        </p>
+                      )}
                       <p className="mt-1 text-xs text-slate-600 leading-snug">
-                        {ev.geofence_name_snapshot ? `${ev.geofence_name_snapshot} — ` : ''}
                         {ev.address}
                       </p>
                       <div className="mt-2 flex items-center justify-between gap-2">

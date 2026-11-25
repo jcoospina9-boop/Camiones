@@ -21,6 +21,7 @@ export async function apiFetch<T>(
   options: RequestInit = {}
 ): Promise<T> {
   const headers = new Headers(options.headers);
+  headers.set('X-Requested-With', 'XMLHttpRequest');
   if (!headers.has('Content-Type') && options.body && typeof options.body === 'string') {
     headers.set('Content-Type', 'application/json');
   }
@@ -29,6 +30,7 @@ export async function apiFetch<T>(
   }
 
   const res = await fetch(path, {
+    credentials: 'same-origin',
     ...options,
     headers,
   });
@@ -48,11 +50,11 @@ export async function apiFetch<T>(
 }
 
 export async function apiDownload(path: string, filename: string): Promise<void> {
-  const headers = new Headers();
+  const headers = new Headers({ 'X-Requested-With': 'XMLHttpRequest' });
   if (authToken) {
     headers.set('Authorization', `Bearer ${authToken}`);
   }
-  const res = await fetch(path, { headers });
+  const res = await fetch(path, { credentials: 'same-origin', headers });
   if (!res.ok) {
     throw new ApiError('No se pudo descargar el archivo de respaldo.', res.status);
   }

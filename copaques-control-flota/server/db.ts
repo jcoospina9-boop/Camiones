@@ -53,6 +53,8 @@ export function initDatabase(): void {
       model TEXT NOT NULL DEFAULT '',
       capacity_tons REAL NOT NULL DEFAULT 0,
       sede_id INTEGER REFERENCES sedes(id) ON DELETE SET NULL,
+      soat_expires_at TEXT NOT NULL DEFAULT '',
+      tecnomecanica_expires_at TEXT NOT NULL DEFAULT '',
       active INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL
     );
@@ -62,10 +64,12 @@ export function initDatabase(): void {
       username TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       full_name TEXT NOT NULL,
+      driver_code TEXT,
       role TEXT NOT NULL CHECK(role IN ('CONDUCTOR', 'ADMIN', 'GERENCIA')),
       sede_id INTEGER REFERENCES sedes(id) ON DELETE SET NULL,
       vehicle_id INTEGER REFERENCES vehicles(id) ON DELETE SET NULL,
       active INTEGER NOT NULL DEFAULT 1,
+      deleted_at TEXT,
       created_at TEXT NOT NULL
     );
 
@@ -96,6 +100,7 @@ export function initDatabase(): void {
       user_id INTEGER NOT NULL REFERENCES users(id),
       username_snapshot TEXT NOT NULL,
       driver_name_snapshot TEXT NOT NULL,
+      driver_code_snapshot TEXT NOT NULL DEFAULT '',
       vehicle_id INTEGER REFERENCES vehicles(id),
       vehicle_code_snapshot TEXT NOT NULL,
       vehicle_plate_snapshot TEXT NOT NULL,
@@ -170,6 +175,12 @@ export function initDatabase(): void {
   if (!hasColumn('vehicles', 'sede_id')) {
     db.exec('ALTER TABLE vehicles ADD COLUMN sede_id INTEGER REFERENCES sedes(id) ON DELETE SET NULL;');
   }
+  if (!hasColumn('vehicles', 'soat_expires_at')) {
+    db.exec("ALTER TABLE vehicles ADD COLUMN soat_expires_at TEXT NOT NULL DEFAULT '';");
+  }
+  if (!hasColumn('vehicles', 'tecnomecanica_expires_at')) {
+    db.exec("ALTER TABLE vehicles ADD COLUMN tecnomecanica_expires_at TEXT NOT NULL DEFAULT '';");
+  }
   if (!hasColumn('geofences', 'sede_id')) {
     db.exec('ALTER TABLE geofences ADD COLUMN sede_id INTEGER REFERENCES sedes(id) ON DELETE SET NULL;');
   }
@@ -178,6 +189,15 @@ export function initDatabase(): void {
   }
   if (!hasColumn('events', 'sede_name_snapshot')) {
     db.exec("ALTER TABLE events ADD COLUMN sede_name_snapshot TEXT NOT NULL DEFAULT '';");
+  }
+  if (!hasColumn('events', 'driver_code_snapshot')) {
+    db.exec("ALTER TABLE events ADD COLUMN driver_code_snapshot TEXT NOT NULL DEFAULT '';");
+  }
+  if (!hasColumn('users', 'driver_code')) {
+    db.exec('ALTER TABLE users ADD COLUMN driver_code TEXT;');
+  }
+  if (!hasColumn('users', 'deleted_at')) {
+    db.exec('ALTER TABLE users ADD COLUMN deleted_at TEXT;');
   }
 
   // Migrate users table if missing sede_id or missing ADMIN role in CHECK constraint
@@ -191,6 +211,8 @@ export function initDatabase(): void {
 
   if (needsUsersMigration) {
     const hasSedeCol = hasColumn('users', 'sede_id');
+    const hasCodeCol = hasColumn('users', 'driver_code');
+    const hasDeletedCol = hasColumn('users', 'deleted_at');
     db.pragma('foreign_keys = OFF');
     const migrateTx = db.transaction(() => {
       db.exec(`
@@ -199,15 +221,23 @@ export function initDatabase(): void {
           username TEXT NOT NULL UNIQUE,
           password_hash TEXT NOT NULL,
           full_name TEXT NOT NULL,
+          driver_code TEXT,
           role TEXT NOT NULL CHECK(role IN ('CONDUCTOR', 'ADMIN', 'GERENCIA')),
           sede_id INTEGER REFERENCES sedes(id) ON DELETE SET NULL,
           vehicle_id INTEGER REFERENCES vehicles(id) ON DELETE SET NULL,
           active INTEGER NOT NULL DEFAULT 1,
+          deleted_at TEXT,
           created_at TEXT NOT NULL
         );
 
-        INSERT INTO users_new (id, username, password_hash, full_name, role, sede_id, vehicle_id, active, created_at)
-        SELECT id, username, password_hash, full_name, role, ${hasSedeCol ? 'sede_id' : 'NULL'}, vehicle_id, active, created_at
+        INSERT INTO users_new (id, username, password_hash, full_name, driver_code, role, sede_id, vehicle_id, active, deleted_at, created_at)
+        SELECT id, username, password_hash, full_name,
+               ${hasCodeCol ? 'driver_code' : 'NULL'},
+               role,
+               ${hasSedeCol ? 'sede_id' : 'NULL'},
+               vehicle_id, active,
+               ${hasDeletedCol ? 'deleted_at' : 'NULL'},
+               created_at
         FROM users;
 
         DROP TABLE users;
@@ -218,16 +248,41 @@ export function initDatabase(): void {
     db.pragma('foreign_keys = ON');
   }
 
+  // Backfill unique driver_code for any existing CONDUCTOR lacking one
+  const driversWithoutCode = db
+    .prepare(
+      "SELECT id FROM users WHERE role = 'CONDUCTOR' AND deleted_at IS NULL AND (driver_code IS NULL OR TRIM(driver_code) = '')"
+    )
+    .all() as Array<{ id: number }>;
+
+  if (driversWithoutCode.length > 0) {
+    const assignCode = db.prepare('UPDATE users SET driver_code = ? WHERE id = ?');
+    const checkCode = db.prepare(
+      'SELECT id FROM users WHERE driver_code = ? AND deleted_at IS NULL LIMIT 1'
+    );
+    for (const d of driversWithoutCode) {
+      let candidate = `COND-${String(d.id).padStart(3, '0')}`;
+      let suffix = 1;
+      while (checkCode.get(candidate)) {
+        candidate = `COND-${String(d.id).padStart(3, '0')}-${suffix}`;
+        suffix += 1;
+      }
+      assignCode.run(candidate, d.id);
+    }
+  }
+
   // Ensure indexes & immutability triggers exist
   db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_driver_code
+      ON users(driver_code) WHERE deleted_at IS NULL AND driver_code IS NOT NULL AND driver_code != '';
     CREATE INDEX IF NOT EXISTS idx_events_date ON events(event_date);
     CREATE INDEX IF NOT EXISTS idx_events_vehicle_date ON events(vehicle_id, event_date, recorded_at);
     CREATE INDEX IF NOT EXISTS idx_events_user_date ON events(user_id, event_date, recorded_at);
     CREATE INDEX IF NOT EXISTS idx_events_sede_date ON events(sede_id, event_date, recorded_at);
     CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
     CREATE INDEX IF NOT EXISTS idx_geofences_active ON geofences(active, sede_id);
-    CREATE INDEX IF NOT EXISTS idx_users_role ON users(role, active);
-    CREATE INDEX IF NOT EXISTS idx_users_sede ON users(sede_id, role, active);
+    CREATE INDEX IF NOT EXISTS idx_users_role ON users(role, active, deleted_at);
+    CREATE INDEX IF NOT EXISTS idx_users_sede ON users(sede_id, role, active, deleted_at);
     CREATE INDEX IF NOT EXISTS idx_vehicles_sede ON vehicles(sede_id, active);
     CREATE INDEX IF NOT EXISTS idx_route_points_vehicle_date ON route_points(vehicle_id, event_date, recorded_at);
 
